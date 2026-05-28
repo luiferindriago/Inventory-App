@@ -3,8 +3,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from supabase import create_client
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import uuid
+import io
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -49,7 +50,11 @@ def get_ventas():
     return pd.DataFrame(r.data) if r.data else pd.DataFrame()
 
 def get_venta_items(venta_id):
-    r = sb.table("fact_venta_items").select("*, dim_productos(codigo, descripcion)").eq("venta_id", venta_id).execute()
+    r = sb.table("fact_venta_items").select("*, dim_productos(codigo, descripcion, precio_costo)").eq("venta_id", venta_id).execute()
+    return pd.DataFrame(r.data) if r.data else pd.DataFrame()
+
+def get_todas_venta_items():
+    r = sb.table("fact_venta_items").select("*, dim_productos(codigo, descripcion, precio_costo), fact_ventas(fecha, estado)").execute()
     return pd.DataFrame(r.data) if r.data else pd.DataFrame()
 
 def get_pedidos():
@@ -69,30 +74,61 @@ def ensure_fecha(f):
     if not r.data:
         d = date.fromisoformat(str(f)) if isinstance(f, str) else f
         sb.table("dim_tiempo").insert({
-            "fecha": str(d),
-            "anio": d.year, "mes": d.month, "dia": d.day,
-            "mes_nombre": d.strftime("%B"),
-            "trimestre": f"Q{(d.month-1)//3+1}"
+            "fecha": str(d), "anio": d.year, "mes": d.month, "dia": d.day,
+            "mes_nombre": d.strftime("%B"), "trimestre": f"Q{(d.month-1)//3+1}"
         }).execute()
 
 def registrar_movimiento(tipo, categoria, monto, fecha, descripcion, ref_id=None):
     ensure_fecha(fecha)
     sb.table("fact_movimientos").insert({
-        "id": str(uuid.uuid4()),
-        "fecha": str(fecha), "tipo": tipo,
+        "id": str(uuid.uuid4()), "fecha": str(fecha), "tipo": tipo,
         "categoria": categoria, "monto": float(monto),
         "descripcion": descripcion,
         "referencia_id": str(ref_id) if ref_id else None
     }).execute()
 
-# ── ESTILO ────────────────────────────────────────────────────────────────────
+def calcular_profit_items(items_df):
+    """Calcula profit por item usando precio_costo actual del producto."""
+    if items_df.empty:
+        return items_df
+    def get_costo(row):
+        prod = row.get("dim_productos")
+        if isinstance(prod, dict):
+            return float(prod.get("precio_costo", 0))
+        return 0.0
+    items_df = items_df.copy()
+    items_df["costo_unit"] = items_df.apply(get_costo, axis=1)
+    items_df["costo_total"] = items_df["costo_unit"] * items_df["cantidad"]
+    items_df["profit"] = items_df["subtotal"] - items_df["costo_total"]
+    items_df["margen_pct"] = items_df.apply(
+        lambda r: (r["profit"] / r["subtotal"] * 100) if r["subtotal"] > 0 else 0, axis=1)
+    return items_df
+
+def filtrar_por_periodo(df, col_fecha, periodo):
+    hoy = date.today()
+    if periodo == "Esta semana":
+        inicio = hoy - timedelta(days=hoy.weekday())
+    elif periodo == "Este mes":
+        inicio = hoy.replace(day=1)
+    elif periodo == "Este año":
+        inicio = hoy.replace(month=1, day=1)
+    else:
+        return df
+    df = df.copy()
+    df[col_fecha] = pd.to_datetime(df[col_fecha]).dt.date
+    return df[df[col_fecha] >= inicio]
+
+# ── ESTILOS ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
 [data-testid="stMetricLabel"] { font-size: 0.85rem !important; color: #888; }
 .stTabs [data-baseweb="tab"] { font-size: 1rem; padding: 8px 20px; }
 div[data-testid="stExpander"] { border: 1px solid #333; border-radius: 8px; }
-.stDataFrame { border-radius: 8px; }
+.profit-box { background: #1a2e1a; border: 1px solid #2d6a3f; border-radius: 8px;
+              padding: 1rem; margin-top: 0.5rem; }
+.profit-row { display: flex; justify-content: space-between; font-size: 13px;
+              padding: 4px 0; border-bottom: 1px solid #2d3a2d; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,6 +146,7 @@ with st.sidebar:
         "🚚 Pedidos",
         "👥 Clientes",
         "💰 Finanzas",
+        "📤 Exportar datos",
     ], label_visibility="collapsed")
     st.divider()
     st.caption(f"📅 {date.today().strftime('%d/%m/%Y')}")
@@ -124,64 +161,141 @@ if pagina == "🏠 Dashboard":
     ventas_df    = get_ventas()
     movs_df      = get_movimientos()
 
-    # KPIs
-    ingresos = movs_df[movs_df["tipo"]=="ingreso"]["monto"].sum() if not movs_df.empty else 0
-    egresos  = movs_df[movs_df["tipo"]=="egreso"]["monto"].sum()  if not movs_df.empty else 0
-    balance  = ingresos - egresos
-    n_ventas = len(ventas_df[ventas_df["estado"]=="Completada"]) if not ventas_df.empty else 0
-    stock_bajo = len(productos_df[productos_df["stock_actual"] <= productos_df["stock_minimo"]]) if not productos_df.empty else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💵 Ingresos", fmt_usd(ingresos))
-    c2.metric("📤 Egresos",  fmt_usd(egresos))
-    c3.metric("⚖️ Balance",  fmt_usd(balance), delta=fmt_usd(balance))
-    c4.metric("🛒 Ventas completadas", n_ventas)
+    # ── Filtro de período ──────────────────────────────────────────────────
+    periodo = st.radio("Período", ["Esta semana", "Este mes", "Este año", "Todo"],
+                       horizontal=True, key="dash_periodo")
 
     st.divider()
-    col1, col2 = st.columns([2,1])
+
+    # ── Calcular profit del período ───────────────────────────────────────
+    todos_items = get_todas_venta_items()
+
+    def calcular_kpis_periodo(ventas_df, todos_items, movs_df, periodo):
+        if ventas_df.empty:
+            return 0, 0, 0, 0, 0
+        v = ventas_df[ventas_df["estado"] == "Completada"].copy()
+        if periodo != "Todo":
+            v = filtrar_por_periodo(v, "fecha", periodo)
+        ingresos_p = v["total"].sum() if not v.empty else 0
+        n_ventas_p = len(v)
+
+        # Profit: cruzar con items del período
+        profit_p = 0
+        costo_p  = 0
+        if not todos_items.empty and not v.empty:
+            venta_ids = set(v["id"].tolist())
+            items_p = todos_items[todos_items["venta_id"].isin(venta_ids)].copy()
+            if not items_p.empty:
+                items_p = calcular_profit_items(items_p)
+                profit_p = items_p["profit"].sum()
+                costo_p  = items_p["costo_total"].sum()
+
+        # Egresos del período
+        if not movs_df.empty:
+            eg = movs_df[movs_df["tipo"] == "egreso"].copy()
+            if periodo != "Todo":
+                eg = filtrar_por_periodo(eg, "fecha", periodo)
+            egresos_p = eg["monto"].sum() if not eg.empty else 0
+        else:
+            egresos_p = 0
+
+        return ingresos_p, profit_p, costo_p, n_ventas_p, egresos_p
+
+    ingresos_p, profit_p, costo_p, n_ventas_p, egresos_p = calcular_kpis_periodo(
+        ventas_df, todos_items, movs_df, periodo)
+
+    margen_p = (profit_p / ingresos_p * 100) if ingresos_p > 0 else 0
+
+    # ── KPIs principales ──────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("💵 Ingresos", fmt_usd(ingresos_p))
+    c2.metric("💚 Profit bruto", fmt_usd(profit_p))
+    c3.metric("📊 Margen", f"{margen_p:.1f}%")
+    c4.metric("🛒 Ventas", n_ventas_p)
+    c5.metric("📤 Egresos", fmt_usd(egresos_p))
+
+    st.divider()
+
+    col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.subheader("📊 Ventas recientes")
+        # Gráfico profit vs ingresos por mes
+        if not todos_items.empty and not ventas_df.empty:
+            v_comp = ventas_df[ventas_df["estado"] == "Completada"].copy()
+            if not v_comp.empty:
+                items_graf = todos_items[todos_items["venta_id"].isin(v_comp["id"])].copy()
+                if not items_graf.empty:
+                    items_graf = calcular_profit_items(items_graf)
+                    # Unir con fecha de venta
+                    fecha_map = v_comp.set_index("id")["fecha"].to_dict()
+                    items_graf["fecha_venta"] = items_graf["venta_id"].map(fecha_map)
+                    items_graf["mes"] = pd.to_datetime(items_graf["fecha_venta"]).dt.strftime("%Y-%m")
+                    por_mes = items_graf.groupby("mes").agg(
+                        ingresos=("subtotal","sum"),
+                        profit=("profit","sum"),
+                        costo=("costo_total","sum")
+                    ).reset_index()
+
+                    fig = go.Figure()
+                    fig.add_bar(x=por_mes["mes"], y=por_mes["ingresos"],
+                                name="Ingresos", marker_color="#d4860a")
+                    fig.add_bar(x=por_mes["mes"], y=por_mes["profit"],
+                                name="Profit", marker_color="#2d9955")
+                    fig.add_bar(x=por_mes["mes"], y=por_mes["costo"],
+                                name="Costo", marker_color="#555555")
+                    fig.update_layout(
+                        barmode="group", title="Ingresos / Profit / Costo por mes",
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        legend=dict(orientation="h", y=1.1),
+                        margin=dict(l=0,r=0,t=40,b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Sin datos de ventas para graficar.")
+
+        # Ventas recientes
+        st.subheader("📋 Ventas recientes")
         if not ventas_df.empty:
-            recent = ventas_df.head(10).copy()
+            recent = ventas_df.head(8).copy()
             recent["cliente"] = recent["dim_clientes"].apply(
                 lambda x: x["nombre"] if isinstance(x, dict) else "Cliente directo")
             recent["total_fmt"] = recent["total"].apply(fmt_usd)
             st.dataframe(
                 recent[["fecha","cliente","total_fmt","estado"]].rename(columns={
-                    "fecha":"Fecha","cliente":"Cliente",
-                    "total_fmt":"Total","estado":"Estado"}),
+                    "fecha":"Fecha","cliente":"Cliente","total_fmt":"Total","estado":"Estado"}),
                 use_container_width=True, hide_index=True)
         else:
             st.info("Sin ventas registradas aún.")
 
     with col2:
+        # Top productos por profit
+        st.subheader("🏆 Top por profit")
+        if not todos_items.empty:
+            top_items = calcular_profit_items(todos_items.copy())
+            top_items["producto"] = top_items["dim_productos"].apply(
+                lambda x: x["codigo"] if isinstance(x, dict) else "—")
+            top = top_items.groupby("producto")["profit"].sum().sort_values(ascending=False).head(8)
+            if not top.empty:
+                for cod, pft in top.items():
+                    st.write(f"**{cod}** — {fmt_usd(pft)}")
+            else:
+                st.info("Sin datos aún.")
+        else:
+            st.info("Sin ventas.")
+
+        st.divider()
+
+        # Alertas de stock
         st.subheader("⚠️ Stock bajo")
         if not productos_df.empty:
             bajos = productos_df[productos_df["stock_actual"] <= productos_df["stock_minimo"]]
             if not bajos.empty:
                 for _, p in bajos.iterrows():
-                    color = "🔴" if p["stock_actual"] == 0 else "🟡"
+                    color = "🔴" if p["stock_actual"] <= 0 else "🟡"
                     st.write(f"{color} **{p['codigo']}** — {p['stock_actual']} uds")
             else:
-                st.success("✅ Todo el stock en orden")
+                st.success("✅ Todo en orden")
         else:
-            st.info("Sin productos cargados.")
-
-    # Gráfico ventas por categoría
-    if not ventas_df.empty and not productos_df.empty:
-        st.divider()
-        st.subheader("🏆 Ingresos por mes")
-        movs_ing = movs_df[movs_df["tipo"]=="ingreso"].copy() if not movs_df.empty else pd.DataFrame()
-        if not movs_ing.empty:
-            movs_ing["fecha"] = pd.to_datetime(movs_ing["fecha"])
-            movs_ing["mes"] = movs_ing["fecha"].dt.strftime("%Y-%m")
-            por_mes = movs_ing.groupby("mes")["monto"].sum().reset_index()
-            fig = px.bar(por_mes, x="mes", y="monto", labels={"mes":"Mes","monto":"Ingresos ($)"},
-                        color_discrete_sequence=["#d4860a"])
-            fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                             showlegend=False, margin=dict(l=0,r=0,t=20,b=0))
-            st.plotly_chart(fig, use_container_width=True)
+            st.info("Sin productos.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVENTARIO
@@ -212,7 +326,7 @@ elif pagina == "📦 Inventario":
                 lambda r: f"{((r['precio_venta']-r['precio_costo'])/r['precio_costo']*100):.0f}%"
                 if r["precio_costo"] > 0 else "—", axis=1)
             fil["stock_status"] = fil.apply(
-                lambda r: "🔴 Agotado" if r["stock_actual"]==0
+                lambda r: "🔴 Agotado" if r["stock_actual"]<=0
                 else ("🟡 Bajo" if r["stock_actual"]<=r["stock_minimo"] else "🟢 OK"), axis=1)
 
             st.dataframe(
@@ -224,7 +338,6 @@ elif pagina == "📦 Inventario":
                 use_container_width=True, hide_index=True)
 
             st.divider()
-            st.subheader("⬇️ Exportar")
             csv = fil.to_csv(index=False).encode("utf-8")
             st.download_button("📥 Descargar CSV", csv, "inventario.csv", "text/csv")
 
@@ -259,7 +372,8 @@ elif pagina == "📦 Inventario":
 
             if costo > 0 and pventa > 0:
                 margen = (pventa - costo) / costo * 100
-                st.info(f"📊 Margen: **{margen:.1f}%** — Ganancia por unidad: **{fmt_usd(pventa-costo)}**")
+                profit_u = pventa - costo
+                st.info(f"📊 Margen: **{margen:.1f}%** — Profit por unidad: **{fmt_usd(profit_u)}**")
 
             guardar = st.form_submit_button("💾 Guardar producto", use_container_width=True, type="primary")
 
@@ -292,7 +406,6 @@ elif pagina == "🛒 Nueva Venta":
         st.warning("⚠️ No hay productos en inventario. Agrega productos primero.")
         st.stop()
 
-    # Estado de la venta en sesión
     if "items_venta" not in st.session_state:
         st.session_state.items_venta = []
 
@@ -312,14 +425,29 @@ elif pagina == "🛒 Nueva Venta":
     st.divider()
     st.subheader("➕ Agregar productos")
 
-    # Selector de producto
+    # Mapa de costo por producto_id para calcular profit en tiempo real
+    costo_map = {str(r["id"]): float(r["precio_costo"]) for _, r in productos_df.iterrows()}
+
     prods_opts = {f"{r['codigo']} — {r['descripcion']} (Stock: {r['stock_actual']})": r
                   for _, r in productos_df.iterrows()}
     pc1, pc2, pc3 = st.columns([3,1,1])
     prod_elegido = pc1.selectbox("Producto", list(prods_opts.keys()), label_visibility="collapsed")
     prod_data = prods_opts[prod_elegido]
-    cantidad  = pc2.number_input("Cant.", min_value=1, max_value=int(prod_data["stock_actual"]) if prod_data["stock_actual"] > 0 else 999, value=1)
-    precio_u  = pc3.number_input("Precio $", min_value=0.0, step=0.01, value=float(prod_data["precio_venta"]))
+    cantidad  = pc2.number_input("Cant.", min_value=1,
+                                  max_value=int(prod_data["stock_actual"]) if prod_data["stock_actual"] > 0 else 999,
+                                  value=1)
+    precio_u  = pc3.number_input("Precio $", min_value=0.0, step=0.01,
+                                  value=float(prod_data["precio_venta"]))
+
+    # Mostrar profit del producto seleccionado en tiempo real
+    costo_sel = float(prod_data["precio_costo"])
+    if precio_u > 0 and costo_sel > 0:
+        profit_u_sel = precio_u - costo_sel
+        margen_sel   = profit_u_sel / precio_u * 100
+        col_p1, col_p2, col_p3 = st.columns(3)
+        col_p1.caption(f"Costo: **{fmt_usd(costo_sel)}**")
+        col_p2.caption(f"Profit u.: **{fmt_usd(profit_u_sel)}**")
+        col_p3.caption(f"Margen: **{margen_sel:.1f}%**")
 
     if st.button("➕ Agregar a la venta", use_container_width=True):
         existing = next((i for i in st.session_state.items_venta if i["producto_id"] == prod_data["id"]), None)
@@ -328,29 +456,54 @@ elif pagina == "🛒 Nueva Venta":
             existing["subtotal"] = existing["cantidad"] * existing["precio_unitario"]
         else:
             st.session_state.items_venta.append({
-                "producto_id": prod_data["id"],
+                "producto_id": str(prod_data["id"]),
                 "codigo": prod_data["codigo"],
                 "descripcion": prod_data["descripcion"],
                 "cantidad": cantidad,
                 "precio_unitario": precio_u,
+                "costo_unitario": costo_sel,
                 "subtotal": cantidad * precio_u
             })
         st.rerun()
 
-    # Tabla de items
+    # Tabla de items con profit
     if st.session_state.items_venta:
         st.divider()
         st.subheader("🧾 Productos en esta venta")
-        items_df = pd.DataFrame(st.session_state.items_venta)
-        items_display = items_df[["codigo","descripcion","cantidad","precio_unitario","subtotal"]].copy()
-        items_display.columns = ["Código","Descripción","Cantidad","Precio u.","Subtotal"]
-        items_display["Precio u."] = items_display["Precio u."].apply(fmt_usd)
-        items_display["Subtotal"]  = items_display["Subtotal"].apply(fmt_usd)
-        st.dataframe(items_display, use_container_width=True, hide_index=True)
 
-        total = sum(i["subtotal"] for i in st.session_state.items_venta)
-        st.markdown(f"### 💵 Total: **{fmt_usd(total)}**")
+        rows = []
+        total_ingresos = 0
+        total_costo    = 0
+        for it in st.session_state.items_venta:
+            subtotal = it["subtotal"]
+            costo_t  = it["costo_unitario"] * it["cantidad"]
+            profit_t = subtotal - costo_t
+            margen_t = (profit_t / subtotal * 100) if subtotal > 0 else 0
+            total_ingresos += subtotal
+            total_costo    += costo_t
+            rows.append({
+                "Código":      it["codigo"],
+                "Descripción": it["descripcion"],
+                "Cant.":       it["cantidad"],
+                "P. Venta":    fmt_usd(it["precio_unitario"]),
+                "Costo u.":    fmt_usd(it["costo_unitario"]),
+                "Subtotal":    fmt_usd(subtotal),
+                "Profit":      fmt_usd(profit_t),
+                "Margen %":    f"{margen_t:.1f}%",
+            })
 
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        total_profit = total_ingresos - total_costo
+        margen_total = (total_profit / total_ingresos * 100) if total_ingresos > 0 else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("💵 Total venta", fmt_usd(total_ingresos))
+        m2.metric("📦 Costo total", fmt_usd(total_costo))
+        m3.metric("💚 Profit bruto", fmt_usd(total_profit))
+        m4.metric("📊 Margen", f"{margen_total:.1f}%")
+
+        st.divider()
         rc1, rc2 = st.columns(2)
         if rc1.button("🗑️ Limpiar venta", use_container_width=True):
             st.session_state.items_venta = []
@@ -369,7 +522,7 @@ elif pagina == "🛒 Nueva Venta":
                 sb.table("fact_ventas").insert({
                     "id": venta_id, "cliente_id": cliente_id,
                     "fecha": str(fecha_venta), "estado": estado_venta,
-                    "total": total, "notas": notas_venta
+                    "total": total_ingresos, "notas": notas_venta
                 }).execute()
 
                 for item in st.session_state.items_venta:
@@ -381,7 +534,6 @@ elif pagina == "🛒 Nueva Venta":
                         "subtotal": item["subtotal"]
                     }).execute()
                     if estado_venta == "Completada":
-                        # Leer stock real desde DB en el momento exacto de guardar
                         prod_real = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
                         stock_real = prod_real.data[0]["stock_actual"] if prod_real.data else 0
                         sb.table("dim_productos").update({
@@ -389,7 +541,7 @@ elif pagina == "🛒 Nueva Venta":
                         }).eq("id", item["producto_id"]).execute()
 
                 if estado_venta == "Completada":
-                    registrar_movimiento("ingreso","Venta", total, fecha_venta,
+                    registrar_movimiento("ingreso","Venta", total_ingresos, fecha_venta,
                                         f"Venta {venta_id[:8]} — {cliente_sel}", venta_id)
 
                 st.session_state.items_venta = []
@@ -433,9 +585,8 @@ elif pagina == "📋 Historial Ventas":
     fil_display["Total"] = fil_display["Total"].apply(fmt_usd)
     st.dataframe(fil_display, use_container_width=True, hide_index=True)
 
-    # Detalle de venta
     st.divider()
-    st.subheader("🔍 Ver detalle de venta")
+    st.subheader("🔍 Ver detalle con profit")
     if not fil.empty:
         venta_opts = {f"{r['fecha']} — {r['cliente_nombre']} — {fmt_usd(r['total'])}": r["id"]
                       for _, r in fil.iterrows()}
@@ -444,11 +595,19 @@ elif pagina == "📋 Historial Ventas":
         if not items.empty:
             items["producto"] = items["dim_productos"].apply(
                 lambda x: f"{x['codigo']} — {x['descripcion']}" if isinstance(x, dict) else "—")
-            items["subtotal_fmt"] = items["subtotal"].apply(fmt_usd)
-            st.dataframe(items[["producto","cantidad","precio_unitario","subtotal_fmt"]].rename(columns={
-                "producto":"Producto","cantidad":"Cantidad",
-                "precio_unitario":"Precio u.","subtotal_fmt":"Subtotal"}),
+            items = calcular_profit_items(items)
+            items["Precio u."] = items["precio_unitario"].apply(fmt_usd)
+            items["Costo u."]  = items["costo_unit"].apply(fmt_usd)
+            items["Subtotal"]  = items["subtotal"].apply(fmt_usd)
+            items["Profit"]    = items["profit"].apply(fmt_usd)
+            items["Margen %"]  = items["margen_pct"].apply(lambda x: f"{x:.1f}%")
+            st.dataframe(
+                items[["producto","cantidad","Precio u.","Costo u.","Subtotal","Profit","Margen %"]].rename(
+                    columns={"producto":"Producto","cantidad":"Cant."}),
                 use_container_width=True, hide_index=True)
+
+            v_ingreso = items["subtotal_orig"].sum() if "subtotal_orig" in items.columns else fil[fil["id"]==venta_opts[venta_sel]]["total"].values[0]
+            v_profit  = items["profit"].apply(lambda x: float(x.replace("$","").replace(",","")) if isinstance(x, str) else x)
 
     st.divider()
     csv = fil.drop(columns=["dim_clientes"], errors="ignore").to_csv(index=False).encode("utf-8")
@@ -486,7 +645,6 @@ elif pagina == "🚚 Pedidos":
         st.subheader("📦 Selecciona productos y cantidades")
         st.caption("Modifica solo los productos que necesitas — deja en 0 los que no vas a pedir.")
 
-        # Tabla masiva de productos
         ped_data = []
         for _, p in productos_df.iterrows():
             necesita = max(0, int(p["stock_minimo"]) - int(p["stock_actual"]))
@@ -504,8 +662,7 @@ elif pagina == "🚚 Pedidos":
         ped_df = pd.DataFrame(ped_data)
         edited = st.data_editor(
             ped_df[["Código","Descripción","Stock actual","Stock mínimo","Sugerido","Pedir","Costo unit. $"]],
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
             disabled=["Código","Descripción","Stock actual","Stock mínimo","Sugerido"],
             column_config={
                 "Pedir": st.column_config.NumberColumn("Pedir", min_value=0, step=1),
@@ -516,7 +673,7 @@ elif pagina == "🚚 Pedidos":
         items_pedido = edited[edited["Pedir"] > 0]
         if not items_pedido.empty:
             total_ped = (items_pedido["Pedir"] * items_pedido["Costo unit. $"]).sum()
-            st.metric(f"Total estimado del pedido ({len(items_pedido)} productos)", fmt_usd(total_ped))
+            st.metric(f"Total estimado ({len(items_pedido)} productos)", fmt_usd(total_ped))
 
         if st.button("✅ Registrar pedido", type="primary", use_container_width=True):
             if items_pedido.empty:
@@ -537,10 +694,8 @@ elif pagina == "🚚 Pedidos":
                     sb.table("fact_pedidos").insert({
                         "id": pedido_id, "proveedor_id": prov_id,
                         "proveedor_nombre": prov_nombre,
-                        "fecha": str(fecha_ped),
-                        "fecha_eta": str(fecha_eta),
-                        "estado": "Pendiente",
-                        "total": float(total_ped)
+                        "fecha": str(fecha_ped), "fecha_eta": str(fecha_eta),
+                        "estado": "Pendiente", "total": float(total_ped)
                     }).execute()
 
                     for idx, row in items_pedido.iterrows():
@@ -594,7 +749,7 @@ elif pagina == "🚚 Pedidos":
             if not items_det.empty:
                 items_det["Producto"] = items_det["dim_productos"].apply(
                     lambda x: f"{x['codigo']} — {x['descripcion']}" if isinstance(x, dict) else "—")
-                items_det["Costo u."] = items_det["costo_unitario"].apply(fmt_usd)
+                items_det["Costo u."]  = items_det["costo_unitario"].apply(fmt_usd)
                 items_det["Subtotal $"] = items_det["subtotal"].apply(fmt_usd)
                 st.dataframe(
                     items_det[["Producto","cantidad","Costo u.","Subtotal $"]].rename(columns={"cantidad":"Cantidad"}),
@@ -739,3 +894,91 @@ elif pagina == "💰 Finanzas":
                 registrar_movimiento(tipo, cat, monto, fecha, desc)
                 success("Movimiento registrado")
                 st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORTAR DATOS
+# ══════════════════════════════════════════════════════════════════════════════
+elif pagina == "📤 Exportar datos":
+    st.title("📤 Exportar datos")
+    st.caption("Descarga cualquier tabla en CSV — compatible con Excel. Úsalo como respaldo mensual o para análisis.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📦 Inventario")
+        if st.button("Generar", key="exp_inv"):
+            df = get_productos()
+            if not df.empty:
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar inventario.csv", csv, "inventario.csv", "text/csv", key="dl_inv")
+            else:
+                st.info("Sin datos.")
+
+        st.subheader("🛒 Ventas")
+        if st.button("Generar", key="exp_ven"):
+            df = get_ventas()
+            if not df.empty:
+                df["cliente_nombre"] = df["dim_clientes"].apply(
+                    lambda x: x["nombre"] if isinstance(x, dict) else "Cliente directo")
+                df = df.drop(columns=["dim_clientes"], errors="ignore")
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar ventas.csv", csv, "ventas.csv", "text/csv", key="dl_ven")
+            else:
+                st.info("Sin datos.")
+
+        st.subheader("👥 Clientes")
+        if st.button("Generar", key="exp_cli"):
+            df = get_clientes()
+            if not df.empty:
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar clientes.csv", csv, "clientes.csv", "text/csv", key="dl_cli")
+            else:
+                st.info("Sin datos.")
+
+    with col2:
+        st.subheader("🚚 Pedidos")
+        if st.button("Generar", key="exp_ped"):
+            df = get_pedidos()
+            if not df.empty:
+                df["proveedor_nombre"] = df.apply(
+                    lambda r: r["dim_proveedores"]["nombre"] if isinstance(r.get("dim_proveedores"), dict)
+                    else r.get("proveedor_nombre","—"), axis=1)
+                df = df.drop(columns=["dim_proveedores"], errors="ignore")
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar pedidos.csv", csv, "pedidos.csv", "text/csv", key="dl_ped")
+            else:
+                st.info("Sin datos.")
+
+        st.subheader("💰 Movimientos financieros")
+        if st.button("Generar", key="exp_mov"):
+            df = get_movimientos()
+            if not df.empty:
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar movimientos.csv", csv, "movimientos.csv", "text/csv", key="dl_mov")
+            else:
+                st.info("Sin datos.")
+
+        st.subheader("📊 Profit por venta (detalle)")
+        if st.button("Generar", key="exp_profit"):
+            todos = get_todas_venta_items()
+            ventas = get_ventas()
+            if not todos.empty and not ventas.empty:
+                todos = calcular_profit_items(todos)
+                todos["producto"] = todos["dim_productos"].apply(
+                    lambda x: f"{x['codigo']} — {x['descripcion']}" if isinstance(x, dict) else "—")
+                fecha_map = ventas.set_index("id")["fecha"].to_dict()
+                cliente_map = ventas.set_index("id")["dim_clientes"].apply(
+                    lambda x: x["nombre"] if isinstance(x, dict) else "Cliente directo").to_dict()
+                todos["fecha_venta"]   = todos["venta_id"].map(fecha_map)
+                todos["cliente"]       = todos["venta_id"].map(cliente_map)
+                export = todos[["fecha_venta","cliente","producto","cantidad",
+                                "precio_unitario","costo_unit","subtotal","profit","margen_pct"]].copy()
+                export.columns = ["Fecha","Cliente","Producto","Cantidad",
+                                  "P.Venta","Costo u.","Subtotal","Profit","Margen %"]
+                csv = export.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Descargar profit_detalle.csv", csv, "profit_detalle.csv", "text/csv", key="dl_profit")
+            else:
+                st.info("Sin datos.")
+
+    st.divider()
+    st.info("💡 **Consejo:** Exporta inventario, ventas y profit una vez al mes y guárdalos en una carpeta de OneDrive como respaldo.")
