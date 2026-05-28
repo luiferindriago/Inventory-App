@@ -381,8 +381,11 @@ elif pagina == "🛒 Nueva Venta":
                         "subtotal": item["subtotal"]
                     }).execute()
                     if estado_venta == "Completada":
+                        # Leer stock real desde DB en el momento exacto de guardar
+                        prod_real = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
+                        stock_real = prod_real.data[0]["stock_actual"] if prod_real.data else 0
                         sb.table("dim_productos").update({
-                            "stock_actual": int(prod_data["stock_actual"]) - item["cantidad"]
+                            "stock_actual": stock_real - item["cantidad"]
                         }).eq("id", item["producto_id"]).execute()
 
                 if estado_venta == "Completada":
@@ -568,45 +571,54 @@ elif pagina == "🚚 Pedidos":
             lambda r: r["dim_proveedores"]["nombre"] if isinstance(r.get("dim_proveedores"), dict)
             else r.get("proveedor_nombre","—"), axis=1)
 
-        st.dataframe(
-            pedidos_df[["fecha","proveedor","fecha_eta","total","estado"]].rename(columns={
-                "fecha":"Fecha","proveedor":"Proveedor","fecha_eta":"ETA",
-                "total":"Total","estado":"Estado"}),
-            use_container_width=True, hide_index=True)
+        estado_fil_ped = st.selectbox("Filtrar por estado", ["Todos","Pendiente","Recibido","Cancelado"], key="fil_ped_estado")
+        fil_ped = pedidos_df if estado_fil_ped == "Todos" else pedidos_df[pedidos_df["estado"] == estado_fil_ped]
+
+        fil_ped_display = fil_ped[["fecha","proveedor","fecha_eta","total","estado"]].copy()
+        fil_ped_display.columns = ["Fecha","Proveedor","ETA","Total","Estado"]
+        fil_ped_display["Total"] = fil_ped_display["Total"].apply(fmt_usd)
+        st.dataframe(fil_ped_display, use_container_width=True, hide_index=True)
+
+        csv_ped = fil_ped.drop(columns=["dim_proveedores"], errors="ignore").to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Exportar CSV", csv_ped, "pedidos.csv", "text/csv")
 
         st.divider()
-        st.subheader("📬 Marcar pedido como recibido")
-        pedidos_pend = pedidos_df[pedidos_df["estado"] == "Pendiente"]
-        if not pedidos_pend.empty:
-            ped_opts = {f"{r['fecha']} — {r['proveedor']} — {fmt_usd(r['total'])}": r["id"]
-                        for _, r in pedidos_pend.iterrows()}
-            ped_sel = st.selectbox("Selecciona pedido", list(ped_opts.keys()))
+        st.subheader("🔍 Ver detalle de pedido")
+        if not fil_ped.empty:
+            ped_opts_all = {f"{r['fecha']} — {r['proveedor']} — {fmt_usd(r['total'])} [{r['estado']}]": r["id"]
+                           for _, r in fil_ped.iterrows()}
+            ped_det_sel = st.selectbox("Selecciona pedido", list(ped_opts_all.keys()), key="ped_det_sel")
+            ped_det_id = ped_opts_all[ped_det_sel]
 
-            items_ped = get_pedido_items(ped_opts[ped_sel])
-            if not items_ped.empty:
-                items_ped["producto"] = items_ped["dim_productos"].apply(
+            items_det = get_pedido_items(ped_det_id)
+            if not items_det.empty:
+                items_det["Producto"] = items_det["dim_productos"].apply(
                     lambda x: f"{x['codigo']} — {x['descripcion']}" if isinstance(x, dict) else "—")
-                st.dataframe(items_ped[["producto","cantidad","costo_unitario","subtotal"]].rename(columns={
-                    "producto":"Producto","cantidad":"Cantidad",
-                    "costo_unitario":"Costo u.","subtotal":"Subtotal"}),
+                items_det["Costo u."] = items_det["costo_unitario"].apply(fmt_usd)
+                items_det["Subtotal $"] = items_det["subtotal"].apply(fmt_usd)
+                st.dataframe(
+                    items_det[["Producto","cantidad","Costo u.","Subtotal $"]].rename(columns={"cantidad":"Cantidad"}),
                     use_container_width=True, hide_index=True)
+                st.metric("Total del pedido", fmt_usd(items_det["subtotal"].sum()))
 
-            if st.button("✅ Confirmar recepción — actualiza stock", type="primary", use_container_width=True):
-                try:
-                    ped_id = ped_opts[ped_sel]
-                    sb.table("fact_pedidos").update({"estado":"Recibido"}).eq("id", ped_id).execute()
-                    items = get_pedido_items(ped_id)
-                    for _, item in items.iterrows():
-                        prod = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
-                        if prod.data:
-                            nuevo_stock = prod.data[0]["stock_actual"] + item["cantidad"]
-                            sb.table("dim_productos").update({"stock_actual": nuevo_stock}).eq("id", item["producto_id"]).execute()
-                    success("Stock actualizado al recibir pedido")
-                    st.rerun()
-                except Exception as e:
-                    error(f"Error: {e}")
-        else:
-            st.info("No hay pedidos pendientes.")
+            ped_row = fil_ped[fil_ped["id"] == ped_det_id].iloc[0]
+            if ped_row["estado"] == "Pendiente":
+                st.divider()
+                if st.button("✅ Marcar como recibido — actualiza stock", type="primary", use_container_width=True):
+                    try:
+                        sb.table("fact_pedidos").update({"estado":"Recibido"}).eq("id", ped_det_id).execute()
+                        items = get_pedido_items(ped_det_id)
+                        for _, item in items.iterrows():
+                            prod = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
+                            if prod.data:
+                                nuevo_stock = prod.data[0]["stock_actual"] + item["cantidad"]
+                                sb.table("dim_productos").update({"stock_actual": nuevo_stock}).eq("id", item["producto_id"]).execute()
+                        success("Stock actualizado al recibir pedido")
+                        st.rerun()
+                    except Exception as e:
+                        error(f"Error: {e}")
+            else:
+                st.info(f"Este pedido ya está marcado como **{ped_row['estado']}**.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLIENTES
