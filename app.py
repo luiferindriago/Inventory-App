@@ -101,7 +101,7 @@ def calcular_profit_items(items_df):
     items_df["costo_total"] = items_df["costo_unit"] * items_df["cantidad"]
     items_df["profit"] = items_df["subtotal"] - items_df["costo_total"]
     items_df["margen_pct"] = items_df.apply(
-        lambda r: (r["profit"] / r["subtotal"] * 100) if r["subtotal"] > 0 else 0, axis=1)
+        lambda r: (r["profit"] / r["costo_total"] * 100) if r["costo_total"] > 0 else 0, axis=1)
     return items_df
 
 def filtrar_por_periodo(df, col_fecha, periodo):
@@ -204,7 +204,7 @@ if pagina == "🏠 Dashboard":
     ingresos_p, profit_p, costo_p, n_ventas_p, egresos_p = calcular_kpis_periodo(
         ventas_df, todos_items, movs_df, periodo)
 
-    margen_p = (profit_p / ingresos_p * 100) if ingresos_p > 0 else 0
+    margen_p = (profit_p / costo_p * 100) if costo_p > 0 else 0
 
     # ── KPIs principales ──────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -303,7 +303,7 @@ if pagina == "🏠 Dashboard":
 elif pagina == "📦 Inventario":
     st.title("📦 Inventario")
 
-    tab1, tab2 = st.tabs(["📋 Ver inventario", "➕ Agregar / Editar producto"])
+    tab1, tab2, tab3 = st.tabs(["📋 Ver inventario", "➕ Agregar / Editar producto", "🔍 Trazabilidad"])
 
     with tab1:
         df = get_productos()
@@ -443,7 +443,7 @@ elif pagina == "🛒 Nueva Venta":
     costo_sel = float(prod_data["precio_costo"])
     if precio_u > 0 and costo_sel > 0:
         profit_u_sel = precio_u - costo_sel
-        margen_sel   = profit_u_sel / precio_u * 100
+        margen_sel   = profit_u_sel / costo_sel * 100 if costo_sel > 0 else 0
         col_p1, col_p2, col_p3 = st.columns(3)
         col_p1.caption(f"Costo: **{fmt_usd(costo_sel)}**")
         col_p2.caption(f"Profit u.: **{fmt_usd(profit_u_sel)}**")
@@ -478,7 +478,8 @@ elif pagina == "🛒 Nueva Venta":
             subtotal = it["subtotal"]
             costo_t  = it["costo_unitario"] * it["cantidad"]
             profit_t = subtotal - costo_t
-            margen_t = (profit_t / subtotal * 100) if subtotal > 0 else 0
+            costo_t_base = it["costo_unitario"] * it["cantidad"]
+            margen_t = (profit_t / costo_t_base * 100) if costo_t_base > 0 else 0
             total_ingresos += subtotal
             total_costo    += costo_t
             rows.append({
@@ -495,7 +496,7 @@ elif pagina == "🛒 Nueva Venta":
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         total_profit = total_ingresos - total_costo
-        margen_total = (total_profit / total_ingresos * 100) if total_ingresos > 0 else 0
+        margen_total = (total_profit / total_costo * 100) if total_costo > 0 else 0
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("💵 Total venta", fmt_usd(total_ingresos))
@@ -551,6 +552,169 @@ elif pagina == "🛒 Nueva Venta":
                 error(f"Error al guardar: {e}")
     else:
         st.info("Agrega productos arriba para comenzar la venta.")
+
+
+    with tab3:
+        st.subheader("🔍 Trazabilidad por producto")
+        st.caption("Reconstruye la historia completa de un producto: stock inicial → pedidos → ventas → stock actual.")
+
+        df_prods = get_productos()
+        if df_prods.empty:
+            st.info("Sin productos registrados.")
+            st.stop()
+
+        prod_opts = {f"{r['codigo']} — {r['descripcion']}": r for _, r in df_prods.iterrows()}
+        prod_sel_traz = st.selectbox("Selecciona producto", list(prod_opts.keys()), key="traz_prod")
+        prod_traz = prod_opts[prod_sel_traz]
+        prod_id   = str(prod_traz["id"])
+        stock_db  = int(prod_traz["stock_actual"])
+
+        st.divider()
+
+        # Recolectar todos los movimientos del producto
+        movimientos_hist = []
+
+        # 1. Stock inicial (asumimos que el stock inicial fue lo que quedó registrado
+        #    en la creación del producto — lo marcamos como referencia)
+        movimientos_hist.append({
+            "fecha": "—",
+            "tipo": "📋 Stock inicial",
+            "referencia": "Carga inicial del sistema",
+            "cantidad": "—",
+            "efecto": "—",
+            "stock_resultado": "—",
+            "_orden": 0,
+            "_stock_calc": None
+        })
+
+        # 2. Pedidos que incluyen este producto
+        try:
+            ped_items_r = sb.table("fact_pedido_items")                .select("*, fact_pedidos(fecha, estado, proveedor_nombre)")                .eq("producto_id", prod_id).execute()
+            for pi in (ped_items_r.data or []):
+                ped = pi.get("fact_pedidos") or {}
+                movimientos_hist.append({
+                    "fecha": ped.get("fecha","—"),
+                    "tipo": "🚚 Pedido recibido" if ped.get("estado") == "Recibido" else "🕐 Pedido pendiente",
+                    "referencia": ped.get("proveedor_nombre","—"),
+                    "cantidad": int(pi["cantidad"]),
+                    "efecto": f'+{pi["cantidad"]}',
+                    "costo_unit": float(pi.get("costo_unitario", 0)),
+                    "estado_ped": ped.get("estado",""),
+                    "_orden": 1,
+                    "_stock_calc": None
+                })
+        except Exception as e:
+            st.warning(f"Error leyendo pedidos: {e}")
+
+        # 3. Ventas que incluyen este producto
+        try:
+            vta_items_r = sb.table("fact_venta_items")                .select("*, fact_ventas(fecha, estado, dim_clientes(nombre))")                .eq("producto_id", prod_id).execute()
+            for vi in (vta_items_r.data or []):
+                vta = vi.get("fact_ventas") or {}
+                cli = vta.get("dim_clientes")
+                cli_nombre = cli["nombre"] if isinstance(cli, dict) else "Cliente directo"
+                movimientos_hist.append({
+                    "fecha": vta.get("fecha","—"),
+                    "tipo": "🛒 Venta" if vta.get("estado") == "Completada" else f"🔸 Venta ({vta.get('estado','')})",
+                    "referencia": cli_nombre,
+                    "cantidad": int(vi["cantidad"]),
+                    "efecto": f'-{vi["cantidad"]}',
+                    "precio_unit": float(vi.get("precio_unitario", 0)),
+                    "estado_vta": vta.get("estado",""),
+                    "_orden": 2,
+                    "_stock_calc": None
+                })
+        except Exception as e:
+            st.warning(f"Error leyendo ventas: {e}")
+
+        # Ordenar por fecha luego por tipo
+        def sort_key(m):
+            f = m["fecha"]
+            return (f if f != "—" else "0000-00-00", m["_orden"])
+
+        movimientos_hist.sort(key=sort_key)
+
+        # Calcular stock acumulado en cada paso
+        # Partimos del stock actual en DB y recalculamos hacia adelante
+        # En su lugar reconstruimos: buscamos cuánto entró y cuánto salió
+        # para llegar al estado actual
+        entradas = sum(m["cantidad"] for m in movimientos_hist
+                      if m["tipo"] == "🚚 Pedido recibido" and isinstance(m["cantidad"], int))
+        salidas  = sum(m["cantidad"] for m in movimientos_hist
+                      if "🛒 Venta" in m["tipo"] and m.get("estado_vta") == "Completada" and isinstance(m["cantidad"], int))
+        # stock_calculado = stock_db (lo que hay) — eso es el resultado final
+
+        # Mostramos la tabla con efecto acumulado
+        stock_running = stock_db - entradas + salidas  # esto sería el stock antes de todo = inicial
+        stock_inicial_calc = stock_running
+
+        rows_traz = []
+        rows_traz.append({
+            "Fecha":       "Inicio",
+            "Tipo":        "📋 Stock inicial",
+            "Referencia":  "Carga del sistema",
+            "Movimiento":  "—",
+            "Stock calc.": stock_inicial_calc
+        })
+
+        stock_running = stock_inicial_calc
+        for m in movimientos_hist:
+            if m["tipo"] == "📋 Stock inicial":
+                continue
+            es_entrada = "Pedido recibido" in m["tipo"]
+            es_venta_comp = "🛒 Venta" in m["tipo"] and m.get("estado_vta") == "Completada"
+            es_pendiente  = m.get("estado_ped") == "Pendiente" or                             (m.get("estado_vta","") not in ["Completada",""])
+
+            if es_entrada:
+                stock_running += m["cantidad"]
+            elif es_venta_comp:
+                stock_running -= m["cantidad"]
+
+            extra = ""
+            if "costo_unit" in m:
+                extra = f"Costo: ${m['costo_unit']:.2f}/u"
+            elif "precio_unit" in m:
+                extra = f"P.Venta: ${m['precio_unit']:.2f}/u"
+
+            rows_traz.append({
+                "Fecha":       m["fecha"],
+                "Tipo":        m["tipo"],
+                "Referencia":  m["referencia"] + (f" · {extra}" if extra else ""),
+                "Movimiento":  m["efecto"] if (es_entrada or es_venta_comp) else f"({m['efecto']} sin efecto)",
+                "Stock calc.": stock_running if (es_entrada or es_venta_comp) else "—"
+            })
+
+        st.dataframe(pd.DataFrame(rows_traz), use_container_width=True, hide_index=True)
+
+        # Comparación final
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Stock calculado", stock_running)
+        c2.metric("Stock en base de datos", stock_db)
+        diferencia = stock_running - stock_db
+        if diferencia == 0:
+            c3.metric("Diferencia", "0 ✅")
+            st.success("✅ El stock calculado coincide con el registrado en base de datos.")
+        else:
+            c3.metric("Diferencia", f"{diferencia:+d} ⚠️")
+            st.warning(f"⚠️ Hay una diferencia de **{abs(diferencia)} unidades** entre el historial y la base de datos. Revisa si hay ventas pendientes de confirmar o ajustes manuales de stock.")
+
+        # Resumen del producto
+        st.divider()
+        col_a, col_b = st.columns(2)
+        col_a.markdown(f"""
+**Código:** {prod_traz['codigo']}  
+**Descripción:** {prod_traz['descripcion']}  
+**Categoría:** {prod_traz['categoria']}  
+**Unidad:** {prod_traz['unidad']}
+        """)
+        col_b.markdown(f"""
+**Precio costo:** ${prod_traz['precio_costo']:.2f}  
+**Precio venta:** ${prod_traz['precio_venta']:.2f}  
+**Margen:** {((prod_traz['precio_venta']-prod_traz['precio_costo'])/prod_traz['precio_costo']*100):.1f}% sobre costo  
+**Stock mínimo:** {prod_traz['stock_minimo']} uds
+        """)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HISTORIAL VENTAS
