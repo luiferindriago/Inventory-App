@@ -5,7 +5,6 @@ import plotly.graph_objects as go
 from supabase import create_client
 from datetime import date, datetime, timedelta
 import uuid
-import io
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -393,166 +392,6 @@ elif pagina == "📦 Inventario":
                     success("Producto agregado")
                 st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# NUEVA VENTA
-# ══════════════════════════════════════════════════════════════════════════════
-elif pagina == "🛒 Nueva Venta":
-    st.title("🛒 Nueva Venta")
-
-    productos_df = get_productos()
-    clientes_df  = get_clientes()
-
-    if productos_df.empty:
-        st.warning("⚠️ No hay productos en inventario. Agrega productos primero.")
-        st.stop()
-
-    if "items_venta" not in st.session_state:
-        st.session_state.items_venta = []
-
-    col1, col2 = st.columns(2)
-    with col1:
-        clientes_opts = ["— Sin cliente —"] + clientes_df["nombre"].tolist() if not clientes_df.empty else ["— Sin cliente —"]
-        cliente_sel = st.selectbox("👤 Cliente", clientes_opts)
-    with col2:
-        fecha_venta = st.date_input("📅 Fecha", value=date.today())
-
-    col3, col4 = st.columns(2)
-    with col3:
-        estado_venta = st.selectbox("Estado", ["Completada","Pendiente de pago","Cancelada"])
-    with col4:
-        notas_venta = st.text_input("Notas (opcional)")
-
-    st.divider()
-    st.subheader("➕ Agregar productos")
-
-    # Mapa de costo por producto_id para calcular profit en tiempo real
-    costo_map = {str(r["id"]): float(r["precio_costo"]) for _, r in productos_df.iterrows()}
-
-    prods_opts = {f"{r['codigo']} — {r['descripcion']} (Stock: {r['stock_actual']})": r
-                  for _, r in productos_df.iterrows()}
-    pc1, pc2, pc3 = st.columns([3,1,1])
-    prod_elegido = pc1.selectbox("Producto", list(prods_opts.keys()), label_visibility="collapsed")
-    prod_data = prods_opts[prod_elegido]
-    cantidad  = pc2.number_input("Cant.", min_value=1,
-                                  max_value=int(prod_data["stock_actual"]) if prod_data["stock_actual"] > 0 else 999,
-                                  value=1)
-    precio_u  = pc3.number_input("Precio $", min_value=0.0, step=0.01,
-                                  value=float(prod_data["precio_venta"]))
-
-    # Mostrar profit del producto seleccionado en tiempo real
-    costo_sel = float(prod_data["precio_costo"])
-    if precio_u > 0 and costo_sel > 0:
-        profit_u_sel = precio_u - costo_sel
-        margen_sel   = profit_u_sel / costo_sel * 100 if costo_sel > 0 else 0
-        col_p1, col_p2, col_p3 = st.columns(3)
-        col_p1.caption(f"Costo: **{fmt_usd(costo_sel)}**")
-        col_p2.caption(f"Profit u.: **{fmt_usd(profit_u_sel)}**")
-        col_p3.caption(f"Margen: **{margen_sel:.1f}%**")
-
-    if st.button("➕ Agregar a la venta", use_container_width=True):
-        existing = next((i for i in st.session_state.items_venta if i["producto_id"] == prod_data["id"]), None)
-        if existing:
-            existing["cantidad"] += cantidad
-            existing["subtotal"] = existing["cantidad"] * existing["precio_unitario"]
-        else:
-            st.session_state.items_venta.append({
-                "producto_id": str(prod_data["id"]),
-                "codigo": prod_data["codigo"],
-                "descripcion": prod_data["descripcion"],
-                "cantidad": cantidad,
-                "precio_unitario": precio_u,
-                "costo_unitario": costo_sel,
-                "subtotal": cantidad * precio_u
-            })
-        st.rerun()
-
-    # Tabla de items con profit
-    if st.session_state.items_venta:
-        st.divider()
-        st.subheader("🧾 Productos en esta venta")
-
-        rows = []
-        total_ingresos = 0
-        total_costo    = 0
-        for it in st.session_state.items_venta:
-            subtotal = it["subtotal"]
-            costo_t  = it["costo_unitario"] * it["cantidad"]
-            profit_t = subtotal - costo_t
-            costo_t_base = it["costo_unitario"] * it["cantidad"]
-            margen_t = (profit_t / costo_t_base * 100) if costo_t_base > 0 else 0
-            total_ingresos += subtotal
-            total_costo    += costo_t
-            rows.append({
-                "Código":      it["codigo"],
-                "Descripción": it["descripcion"],
-                "Cant.":       it["cantidad"],
-                "P. Venta":    fmt_usd(it["precio_unitario"]),
-                "Costo u.":    fmt_usd(it["costo_unitario"]),
-                "Subtotal":    fmt_usd(subtotal),
-                "Profit":      fmt_usd(profit_t),
-                "Margen %":    f"{margen_t:.1f}%",
-            })
-
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        total_profit = total_ingresos - total_costo
-        margen_total = (total_profit / total_costo * 100) if total_costo > 0 else 0
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("💵 Total venta", fmt_usd(total_ingresos))
-        m2.metric("📦 Costo total", fmt_usd(total_costo))
-        m3.metric("💚 Profit bruto", fmt_usd(total_profit))
-        m4.metric("📊 Margen", f"{margen_total:.1f}%")
-
-        st.divider()
-        rc1, rc2 = st.columns(2)
-        if rc1.button("🗑️ Limpiar venta", use_container_width=True):
-            st.session_state.items_venta = []
-            st.rerun()
-
-        if rc2.button("✅ Registrar venta", use_container_width=True, type="primary"):
-            try:
-                ensure_fecha(fecha_venta)
-                cliente_id = None
-                if cliente_sel != "— Sin cliente —" and not clientes_df.empty:
-                    match = clientes_df[clientes_df["nombre"] == cliente_sel]
-                    if not match.empty:
-                        cliente_id = match.iloc[0]["id"]
-
-                venta_id = str(uuid.uuid4())
-                sb.table("fact_ventas").insert({
-                    "id": venta_id, "cliente_id": cliente_id,
-                    "fecha": str(fecha_venta), "estado": estado_venta,
-                    "total": total_ingresos, "notas": notas_venta
-                }).execute()
-
-                for item in st.session_state.items_venta:
-                    sb.table("fact_venta_items").insert({
-                        "id": str(uuid.uuid4()), "venta_id": venta_id,
-                        "producto_id": item["producto_id"],
-                        "cantidad": item["cantidad"],
-                        "precio_unitario": item["precio_unitario"],
-                        "subtotal": item["subtotal"]
-                    }).execute()
-                    if estado_venta == "Completada":
-                        prod_real = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
-                        stock_real = prod_real.data[0]["stock_actual"] if prod_real.data else 0
-                        sb.table("dim_productos").update({
-                            "stock_actual": stock_real - item["cantidad"]
-                        }).eq("id", item["producto_id"]).execute()
-
-                if estado_venta == "Completada":
-                    registrar_movimiento("ingreso","Venta", total_ingresos, fecha_venta,
-                                        f"Venta {venta_id[:8]} — {cliente_sel}", venta_id)
-
-                st.session_state.items_venta = []
-                success("Venta registrada exitosamente")
-                st.rerun()
-            except Exception as e:
-                error(f"Error al guardar: {e}")
-    else:
-        st.info("Agrega productos arriba para comenzar la venta.")
-
 
     with tab3:
         st.subheader("🔍 Trazabilidad por producto")
@@ -561,7 +400,7 @@ elif pagina == "🛒 Nueva Venta":
         df_prods = get_productos()
         if df_prods.empty:
             st.info("Sin productos registrados.")
-            st.stop()
+            st.stop()  # safe: only triggers if product table is completely empty
 
         prod_opts = {f"{r['codigo']} — {r['descripcion']}": r for _, r in df_prods.iterrows()}
         prod_sel_traz = st.selectbox("Selecciona producto", list(prod_opts.keys()), key="traz_prod")
@@ -663,7 +502,6 @@ elif pagina == "🛒 Nueva Venta":
                 continue
             es_entrada = "Pedido recibido" in m["tipo"]
             es_venta_comp = "🛒 Venta" in m["tipo"] and m.get("estado_vta") == "Completada"
-            es_pendiente  = m.get("estado_ped") == "Pendiente" or                             (m.get("estado_vta","") not in ["Completada",""])
 
             if es_entrada:
                 stock_running += m["cantidad"]
@@ -711,9 +549,165 @@ elif pagina == "🛒 Nueva Venta":
         col_b.markdown(f"""
 **Precio costo:** ${prod_traz['precio_costo']:.2f}  
 **Precio venta:** ${prod_traz['precio_venta']:.2f}  
-**Margen:** {((prod_traz['precio_venta']-prod_traz['precio_costo'])/prod_traz['precio_costo']*100):.1f}% sobre costo  
+**Margen:** { ((prod_traz['precio_venta']-prod_traz['precio_costo'])/prod_traz['precio_costo']*100) if prod_traz['precio_costo']>0 else 0 :.1f}% sobre costo  
 **Stock mínimo:** {prod_traz['stock_minimo']} uds
         """)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVA VENTA
+# ══════════════════════════════════════════════════════════════════════════════
+elif pagina == "🛒 Nueva Venta":
+    st.title("🛒 Nueva Venta")
+
+    productos_df = get_productos()
+    clientes_df  = get_clientes()
+
+    if productos_df.empty:
+        st.warning("⚠️ No hay productos en inventario. Agrega productos primero.")
+        st.stop()
+
+    if "items_venta" not in st.session_state:
+        st.session_state.items_venta = []
+
+    col1, col2 = st.columns(2)
+    with col1:
+        clientes_opts = ["— Sin cliente —"] + clientes_df["nombre"].tolist() if not clientes_df.empty else ["— Sin cliente —"]
+        cliente_sel = st.selectbox("👤 Cliente", clientes_opts)
+    with col2:
+        fecha_venta = st.date_input("📅 Fecha", value=date.today())
+
+    col3, col4 = st.columns(2)
+    with col3:
+        estado_venta = st.selectbox("Estado", ["Completada","Pendiente de pago","Cancelada"])
+    with col4:
+        notas_venta = st.text_input("Notas (opcional)")
+
+    st.divider()
+    st.subheader("➕ Agregar productos")
+
+    prods_opts = {f"{r['codigo']} — {r['descripcion']} (Stock: {r['stock_actual']})": r
+                  for _, r in productos_df.iterrows()}
+    pc1, pc2, pc3 = st.columns([3,1,1])
+    prod_elegido = pc1.selectbox("Producto", list(prods_opts.keys()), label_visibility="collapsed")
+    prod_data = prods_opts[prod_elegido]
+    cantidad  = pc2.number_input("Cant.", min_value=1,
+                                  max_value=int(prod_data["stock_actual"]) if prod_data["stock_actual"] > 0 else 999,
+                                  value=1)
+    precio_u  = pc3.number_input("Precio $", min_value=0.0, step=0.01,
+                                  value=float(prod_data["precio_venta"]))
+
+    # Mostrar profit del producto seleccionado en tiempo real
+    costo_sel = float(prod_data["precio_costo"])
+    if precio_u > 0 and costo_sel > 0:
+        profit_u_sel = precio_u - costo_sel
+        margen_sel   = profit_u_sel / costo_sel * 100 if costo_sel > 0 else 0
+        col_p1, col_p2, col_p3 = st.columns(3)
+        col_p1.caption(f"Costo: **{fmt_usd(costo_sel)}**")
+        col_p2.caption(f"Profit u.: **{fmt_usd(profit_u_sel)}**")
+        col_p3.caption(f"Margen: **{margen_sel:.1f}%**")
+
+    if st.button("➕ Agregar a la venta", use_container_width=True):
+        existing = next((i for i in st.session_state.items_venta if i["producto_id"] == prod_data["id"]), None)
+        if existing:
+            existing["cantidad"] += cantidad
+            existing["subtotal"] = existing["cantidad"] * existing["precio_unitario"]
+        else:
+            st.session_state.items_venta.append({
+                "producto_id": str(prod_data["id"]),
+                "codigo": prod_data["codigo"],
+                "descripcion": prod_data["descripcion"],
+                "cantidad": cantidad,
+                "precio_unitario": precio_u,
+                "costo_unitario": costo_sel,
+                "subtotal": cantidad * precio_u
+            })
+        st.rerun()
+
+    # Tabla de items con profit
+    if st.session_state.items_venta:
+        st.divider()
+        st.subheader("🧾 Productos en esta venta")
+
+        rows = []
+        total_ingresos = 0
+        total_costo    = 0
+        for it in st.session_state.items_venta:
+            subtotal = it["subtotal"]
+            costo_t  = it["costo_unitario"] * it["cantidad"]
+            profit_t = subtotal - costo_t
+            margen_t = (profit_t / costo_t * 100) if costo_t > 0 else 0
+            total_ingresos += subtotal
+            total_costo    += costo_t
+            rows.append({
+                "Código":      it["codigo"],
+                "Descripción": it["descripcion"],
+                "Cant.":       it["cantidad"],
+                "P. Venta":    fmt_usd(it["precio_unitario"]),
+                "Costo u.":    fmt_usd(it["costo_unitario"]),
+                "Subtotal":    fmt_usd(subtotal),
+                "Profit":      fmt_usd(profit_t),
+                "Margen %":    f"{margen_t:.1f}%",
+            })
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        total_profit = total_ingresos - total_costo
+        margen_total = (total_profit / total_costo * 100) if total_costo > 0 else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("💵 Total venta", fmt_usd(total_ingresos))
+        m2.metric("📦 Costo total", fmt_usd(total_costo))
+        m3.metric("💚 Profit bruto", fmt_usd(total_profit))
+        m4.metric("📊 Margen", f"{margen_total:.1f}%")
+
+        st.divider()
+        rc1, rc2 = st.columns(2)
+        if rc1.button("🗑️ Limpiar venta", use_container_width=True):
+            st.session_state.items_venta = []
+            st.rerun()
+
+        if rc2.button("✅ Registrar venta", use_container_width=True, type="primary"):
+            try:
+                ensure_fecha(fecha_venta)
+                cliente_id = None
+                if cliente_sel != "— Sin cliente —" and not clientes_df.empty:
+                    match = clientes_df[clientes_df["nombre"] == cliente_sel]
+                    if not match.empty:
+                        cliente_id = match.iloc[0]["id"]
+
+                venta_id = str(uuid.uuid4())
+                sb.table("fact_ventas").insert({
+                    "id": venta_id, "cliente_id": cliente_id,
+                    "fecha": str(fecha_venta), "estado": estado_venta,
+                    "total": total_ingresos, "notas": notas_venta
+                }).execute()
+
+                for item in st.session_state.items_venta:
+                    sb.table("fact_venta_items").insert({
+                        "id": str(uuid.uuid4()), "venta_id": venta_id,
+                        "producto_id": item["producto_id"],
+                        "cantidad": item["cantidad"],
+                        "precio_unitario": item["precio_unitario"],
+                        "subtotal": item["subtotal"]
+                    }).execute()
+                    if estado_venta == "Completada":
+                        prod_real = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
+                        stock_real = prod_real.data[0]["stock_actual"] if prod_real.data else 0
+                        sb.table("dim_productos").update({
+                            "stock_actual": stock_real - item["cantidad"]
+                        }).eq("id", item["producto_id"]).execute()
+
+                if estado_venta == "Completada":
+                    registrar_movimiento("ingreso","Venta", total_ingresos, fecha_venta,
+                                        f"Venta {venta_id[:8]} — {cliente_sel}", venta_id)
+
+                st.session_state.items_venta = []
+                success("Venta registrada exitosamente")
+                st.rerun()
+            except Exception as e:
+                error(f"Error al guardar: {e}")
+    else:
+        st.info("Agrega productos arriba para comenzar la venta.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -770,8 +764,6 @@ elif pagina == "📋 Historial Ventas":
                     columns={"producto":"Producto","cantidad":"Cant."}),
                 use_container_width=True, hide_index=True)
 
-            v_ingreso = items["subtotal_orig"].sum() if "subtotal_orig" in items.columns else fil[fil["id"]==venta_opts[venta_sel]]["total"].values[0]
-            v_profit  = items["profit"].apply(lambda x: float(x.replace("$","").replace(",","")) if isinstance(x, str) else x)
 
     st.divider()
     csv = fil.drop(columns=["dim_clientes"], errors="ignore").to_csv(index=False).encode("utf-8")
