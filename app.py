@@ -1165,11 +1165,12 @@ elif pagina == "💰 Finanzas":
         if btn_ret:
             if monto_ret <= 0:
                 error("El monto debe ser mayor a 0")
-            elif balance <= 0:
-                error("No hay balance disponible en caja para retirar")
-            elif monto_ret > balance:
-                st.warning(f"⚠️ El monto a retirar ({fmt_usd(monto_ret)}) supera el balance disponible ({fmt_usd(balance)}). ¿Deseas continuar de todos modos?")
             else:
+                # Advertencia informativa si el monto supera el balance, pero no bloquea
+                # El balance contable incluye la inversión inicial como egreso,
+                # por lo que puede diferir del efectivo físico disponible
+                if monto_ret > balance and balance > 0:
+                    st.toast(f"ℹ️ Nota: el monto supera el balance contable ({fmt_usd(balance)})", icon="ℹ️")
                 cat_retiro = f"Retiro {socio}"
                 desc_final = desc_ret if desc_ret else f"Retiro de utilidades — {socio}"
                 registrar_movimiento("egreso", cat_retiro, monto_ret, fecha_ret, desc_final)
