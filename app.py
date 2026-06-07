@@ -774,10 +774,95 @@ elif pagina == "📋 Historial Ventas":
     fil_display["Total"] = fil_display["Total"].apply(fmt_usd)
     st.dataframe(fil_display, use_container_width=True, hide_index=True)
 
+    # ── Ventas pendientes de pago ──────────────────────────────────────────────
+    pendientes = ventas_df[ventas_df["estado"] == "Pendiente de pago"]
+    if not pendientes.empty:
+        st.divider()
+        st.subheader(f"⏳ Ventas pendientes de cobro ({len(pendientes)})")
+        st.caption("Aquí puedes confirmar el cobro o cancelar ventas que no se concretaron.")
+
+        pend_opts = {
+            f"{r['fecha']} — {r['cliente_nombre']} — {fmt_usd(r['total'])}": r
+            for _, r in pendientes.iterrows()
+        }
+        pend_sel_key = st.selectbox("Selecciona venta pendiente", list(pend_opts.keys()), key="pend_sel")
+        pend_venta = pend_opts[pend_sel_key]
+
+        # Mostrar items de la venta pendiente
+        items_pend = get_venta_items(pend_venta["id"])
+        if not items_pend.empty:
+            items_pend["Producto"] = items_pend["dim_productos"].apply(
+                lambda x: f"{x['codigo']} — {x['descripcion']}" if isinstance(x, dict) else "—")
+            items_pend["P. Venta"] = items_pend["precio_unitario"].apply(fmt_usd)
+            items_pend["Subtotal"] = items_pend["subtotal"].apply(fmt_usd)
+            st.dataframe(
+                items_pend[["Producto","cantidad","P. Venta","Subtotal"]].rename(
+                    columns={"cantidad":"Cant."}),
+                use_container_width=True, hide_index=True)
+            st.markdown(f"**Total: {fmt_usd(pend_venta['total'])}**")
+
+        # Advertencia de stock antes de confirmar
+        alertas_stock = []
+        if not items_pend.empty:
+            for _, it in items_pend.iterrows():
+                prod_r = sb.table("dim_productos").select("codigo, stock_actual").eq(
+                    "id", it["producto_id"]).execute()
+                if prod_r.data:
+                    p = prod_r.data[0]
+                    if p["stock_actual"] < it["cantidad"]:
+                        alertas_stock.append(
+                            f"⚠️ **{p['codigo']}**: stock disponible ({p['stock_actual']}) "
+                            f"menor a cantidad vendida ({it['cantidad']})")
+        if alertas_stock:
+            for alerta in alertas_stock:
+                st.warning(alerta)
+
+        col_comp, col_canc = st.columns(2)
+        btn_completar = col_comp.button(
+            "✅ Confirmar cobro — marcar como Completada",
+            use_container_width=True, type="primary", key="btn_completar_pend")
+        btn_cancelar = col_canc.button(
+            "❌ Cancelar esta venta",
+            use_container_width=True, key="btn_cancelar_pend")
+
+        if btn_completar:
+            try:
+                # Cambiar estado
+                sb.table("fact_ventas").update({"estado": "Completada"}).eq(
+                    "id", pend_venta["id"]).execute()
+                # Descontar stock en tiempo real por cada item
+                items_raw = get_venta_items(pend_venta["id"])
+                for _, item in items_raw.iterrows():
+                    prod_real = sb.table("dim_productos").select("stock_actual").eq(
+                        "id", item["producto_id"]).execute()
+                    stock_real = prod_real.data[0]["stock_actual"] if prod_real.data else 0
+                    nuevo_stock = max(0, stock_real - item["cantidad"])
+                    sb.table("dim_productos").update({"stock_actual": nuevo_stock}).eq(
+                        "id", item["producto_id"]).execute()
+                # Registrar ingreso
+                registrar_movimiento(
+                    "ingreso", "Venta", pend_venta["total"],
+                    pend_venta["fecha"],
+                    f"Cobro venta {pend_venta['id'][:8]} — {pend_venta['cliente_nombre']}",
+                    pend_venta["id"])
+                success(f"Venta confirmada — stock actualizado e ingreso registrado")
+                st.rerun()
+            except Exception as e:
+                error(f"Error al confirmar: {e}")
+
+        if btn_cancelar:
+            try:
+                sb.table("fact_ventas").update({"estado": "Cancelada"}).eq(
+                    "id", pend_venta["id"]).execute()
+                success("Venta cancelada — el stock no fue afectado")
+                st.rerun()
+            except Exception as e:
+                error(f"Error al cancelar: {e}")
+
     st.divider()
     st.subheader("🔍 Ver detalle con profit")
     if not fil.empty:
-        venta_opts = {f"{r['fecha']} — {r['cliente_nombre']} — {fmt_usd(r['total'])}": r["id"]
+        venta_opts = {f"{r['fecha']} — {r['cliente_nombre']} — {fmt_usd(r['total'])} [{r['estado']}]": r["id"]
                       for _, r in fil.iterrows()}
         venta_sel = st.selectbox("Selecciona venta", list(venta_opts.keys()))
         items = get_venta_items(venta_opts[venta_sel])
@@ -794,7 +879,6 @@ elif pagina == "📋 Historial Ventas":
                 items[["producto","cantidad","Precio u.","Costo u.","Subtotal","Profit","Margen %"]].rename(
                     columns={"producto":"Producto","cantidad":"Cant."}),
                 use_container_width=True, hide_index=True)
-
 
     st.divider()
     csv = fil.drop(columns=["dim_clientes"], errors="ignore").to_csv(index=False).encode("utf-8")
