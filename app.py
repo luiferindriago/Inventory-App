@@ -336,8 +336,18 @@ elif pagina == "📦 Inventario":
                     "precio_venta":"Venta $","margen":"Margen","stock_status":"Estado","unidad":"Unidad"}),
                 use_container_width=True, hide_index=True)
 
+            # Valor total del inventario filtrado
+            fil["valor_stock"] = fil["stock_actual"] * fil["precio_costo"]
+            valor_total_fil = fil["valor_stock"].sum()
+            valor_venta_fil = (fil["stock_actual"] * fil["precio_venta"]).sum()
+            vi1, vi2 = st.columns(2)
+            vi1.metric("💰 Valor al costo (inventario filtrado)", fmt_usd(valor_total_fil),
+                       help="Stock actual × precio costo")
+            vi2.metric("🏷️ Valor al precio de venta", fmt_usd(valor_venta_fil),
+                       help="Stock actual × precio de venta")
+
             st.divider()
-            csv = fil.to_csv(index=False).encode("utf-8")
+            csv = fil.drop(columns=["valor_stock"], errors="ignore").to_csv(index=False).encode("utf-8")
             st.download_button("📥 Descargar CSV", csv, "inventario.csv", "text/csv")
 
     with tab2:
@@ -623,37 +633,58 @@ elif pagina == "🛒 Nueva Venta":
             })
         st.rerun()
 
-    # Tabla de items con profit
+    # Tabla de items con profit y edición por fila
     if st.session_state.items_venta:
         st.divider()
         st.subheader("🧾 Productos en esta venta")
 
-        rows = []
         total_ingresos = 0
         total_costo    = 0
-        for it in st.session_state.items_venta:
+
+        for idx, it in enumerate(st.session_state.items_venta):
             subtotal = it["subtotal"]
             costo_t  = it["costo_unitario"] * it["cantidad"]
             profit_t = subtotal - costo_t
             margen_t = (profit_t / costo_t * 100) if costo_t > 0 else 0
             total_ingresos += subtotal
             total_costo    += costo_t
-            rows.append({
-                "Código":      it["codigo"],
-                "Descripción": it["descripcion"],
-                "Cant.":       it["cantidad"],
-                "P. Venta":    fmt_usd(it["precio_unitario"]),
-                "Costo u.":    fmt_usd(it["costo_unitario"]),
-                "Subtotal":    fmt_usd(subtotal),
-                "Profit":      fmt_usd(profit_t),
-                "Margen %":    f"{margen_t:.1f}%",
-            })
 
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            with st.container():
+                col_desc, col_qty, col_price, col_profit, col_margin, col_del = st.columns([3,1,1,1,1,0.5])
+                col_desc.markdown(f"**{it['codigo']}** {it['descripcion']}")
 
+                new_qty = col_qty.number_input(
+                    "Cant.", min_value=1, value=it["cantidad"],
+                    key=f"qty_{idx}", label_visibility="collapsed")
+                new_price = col_price.number_input(
+                    "Precio", min_value=0.0, step=0.01, value=it["precio_unitario"],
+                    key=f"price_{idx}", label_visibility="collapsed", format="%.2f")
+
+                # Actualizar si cambió cantidad o precio
+                if new_qty != it["cantidad"] or new_price != it["precio_unitario"]:
+                    st.session_state.items_venta[idx]["cantidad"] = new_qty
+                    st.session_state.items_venta[idx]["precio_unitario"] = new_price
+                    st.session_state.items_venta[idx]["subtotal"] = new_qty * new_price
+                    st.rerun()
+
+                nuevo_subtotal = new_qty * new_price
+                nuevo_costo_t  = it["costo_unitario"] * new_qty
+                nuevo_profit   = nuevo_subtotal - nuevo_costo_t
+                nuevo_margen   = (nuevo_profit / nuevo_costo_t * 100) if nuevo_costo_t > 0 else 0
+                col_profit.caption(f"Profit: **{fmt_usd(nuevo_profit)}**")
+                col_margin.caption(f"**{nuevo_margen:.1f}%**")
+
+                if col_del.button("✕", key=f"del_{idx}", help="Eliminar este producto"):
+                    st.session_state.items_venta.pop(idx)
+                    st.rerun()
+
+        # Recalcular totales con valores actuales
+        total_ingresos = sum(i["subtotal"] for i in st.session_state.items_venta)
+        total_costo    = sum(i["costo_unitario"] * i["cantidad"] for i in st.session_state.items_venta)
         total_profit = total_ingresos - total_costo
         margen_total = (total_profit / total_costo * 100) if total_costo > 0 else 0
 
+        st.divider()
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("💵 Total venta", fmt_usd(total_ingresos))
         m2.metric("📦 Costo total", fmt_usd(total_costo))
@@ -937,7 +968,7 @@ elif pagina == "🚚 Pedidos":
 elif pagina == "👥 Clientes":
     st.title("👥 Clientes")
 
-    tab1, tab2 = st.tabs(["📋 Ver clientes", "➕ Agregar cliente"])
+    tab1, tab2, tab3_cli = st.tabs(["📋 Ver clientes", "➕ Agregar cliente", "✏️ Editar / Eliminar"])
 
     with tab1:
         df = get_clientes()
@@ -988,6 +1019,59 @@ elif pagina == "👥 Clientes":
                 success("Cliente guardado")
                 st.rerun()
 
+    with tab3_cli:
+        df_cli_ed = get_clientes()
+        if df_cli_ed.empty:
+            st.info("Sin clientes registrados.")
+        else:
+            cli_opts = {f"{r['nombre']} ({r.get('rif_cedula','') or 'sin RIF'})": r
+                        for _, r in df_cli_ed.iterrows()}
+            cli_sel_ed = st.selectbox("Selecciona cliente", list(cli_opts.keys()), key="cli_ed_sel")
+            cli_ed = cli_opts[cli_sel_ed]
+
+            with st.form("form_editar_cliente"):
+                c1, c2 = st.columns(2)
+                ed_nombre = c1.text_input("Nombre / Razón social *", value=cli_ed.get("nombre",""))
+                ed_rif    = c2.text_input("RIF / Cédula", value=cli_ed.get("rif_cedula","") or "")
+                c3, c4 = st.columns(2)
+                ed_tel   = c3.text_input("Teléfono", value=cli_ed.get("telefono","") or "")
+                ed_email = c4.text_input("Email", value=cli_ed.get("email","") or "")
+                ed_dir   = st.text_input("Dirección", value=cli_ed.get("direccion","") or "")
+                ed_tipo  = st.selectbox("Tipo", ["Persona natural","Empresa","Distribuidor"],
+                                        index=["Persona natural","Empresa","Distribuidor"].index(
+                                            cli_ed.get("tipo","Persona natural"))
+                                        if cli_ed.get("tipo") in ["Persona natural","Empresa","Distribuidor"] else 0)
+                col_save, col_del = st.columns(2)
+                btn_save = col_save.form_submit_button("💾 Guardar cambios", use_container_width=True, type="primary")
+                btn_del  = col_del.form_submit_button("🗑️ Eliminar cliente", use_container_width=True)
+
+            if btn_save:
+                if not ed_nombre:
+                    error("El nombre es obligatorio")
+                else:
+                    sb.table("dim_clientes").update({
+                        "nombre": ed_nombre, "rif_cedula": ed_rif,
+                        "telefono": ed_tel, "email": ed_email,
+                        "direccion": ed_dir, "tipo": ed_tipo
+                    }).eq("id", cli_ed["id"]).execute()
+                    success(f"Cliente '{ed_nombre}' actualizado")
+                    st.rerun()
+
+            if btn_del:
+                # Verificar si tiene ventas asociadas
+                ventas_cli = get_ventas()
+                tiene_ventas = False
+                if not ventas_cli.empty:
+                    tiene_ventas = ventas_cli["dim_clientes"].apply(
+                        lambda x: x.get("nombre") if isinstance(x, dict) else None
+                    ).eq(cli_ed["nombre"]).any()
+                if tiene_ventas:
+                    st.warning(f"⚠️ No se puede eliminar — '{cli_ed['nombre']}' tiene ventas registradas. Puedes editar su nombre si es necesario.")
+                else:
+                    sb.table("dim_clientes").delete().eq("id", cli_ed["id"]).execute()
+                    success(f"Cliente eliminado")
+                    st.rerun()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FINANZAS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -995,18 +1079,36 @@ elif pagina == "💰 Finanzas":
     st.title("💰 Finanzas")
 
     movs_df = get_movimientos()
+    prods_fin = get_productos()
 
     ingresos = movs_df[movs_df["tipo"]=="ingreso"]["monto"].sum() if not movs_df.empty else 0
     egresos  = movs_df[movs_df["tipo"]=="egreso"]["monto"].sum()  if not movs_df.empty else 0
     balance  = ingresos - egresos
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("💵 Ingresos totales", fmt_usd(ingresos))
-    c2.metric("📤 Egresos totales",  fmt_usd(egresos))
-    c3.metric("⚖️ Balance neto",     fmt_usd(balance), delta=fmt_usd(balance))
+    # Retiros por persona
+    ret_luifer = movs_df[movs_df["categoria"]=="Retiro Luifer"]["monto"].sum() if not movs_df.empty else 0
+    ret_omar   = movs_df[movs_df["categoria"]=="Retiro Omar"]["monto"].sum()   if not movs_df.empty else 0
+
+    # Valor del inventario
+    val_inv = (prods_fin["stock_actual"] * prods_fin["precio_costo"]).sum() if not prods_fin.empty else 0
+
+    # KPIs fila 1
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("💵 Ingresos totales",  fmt_usd(ingresos))
+    c2.metric("📤 Egresos totales",   fmt_usd(egresos))
+    c3.metric("⚖️ Balance en caja",   fmt_usd(balance))
+    c4.metric("📦 Valor inventario",  fmt_usd(val_inv), help="Stock actual × precio costo por producto")
+
+    # KPIs fila 2 — retiros
+    st.divider()
+    st.caption("💸 Retiros de utilidades")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Retiro Luifer", fmt_usd(ret_luifer))
+    r2.metric("Retiro Omar",   fmt_usd(ret_omar))
+    r3.metric("Total retirado", fmt_usd(ret_luifer + ret_omar))
 
     st.divider()
-    tab1, tab2 = st.tabs(["📋 Movimientos", "➕ Registro manual"])
+    tab1, tab2, tab3_fin = st.tabs(["📋 Movimientos", "➕ Registro manual", "💸 Registrar retiro"])
 
     with tab1:
         if movs_df.empty:
@@ -1014,7 +1116,8 @@ elif pagina == "💰 Finanzas":
         else:
             c1, c2 = st.columns(2)
             tipo_fil = c1.selectbox("Tipo", ["Todos","ingreso","egreso"])
-            cat_fil  = c2.selectbox("Categoría", ["Todas"] + sorted(movs_df["categoria"].unique().tolist()))
+            all_cats = ["Todas"] + sorted(movs_df["categoria"].dropna().unique().tolist())
+            cat_fil  = c2.selectbox("Categoría", all_cats)
 
             fil = movs_df.copy()
             if tipo_fil != "Todos":  fil = fil[fil["tipo"] == tipo_fil]
@@ -1050,6 +1153,52 @@ elif pagina == "💰 Finanzas":
                 registrar_movimiento(tipo, cat, monto, fecha, desc)
                 success("Movimiento registrado")
                 st.rerun()
+
+    with tab3_fin:
+        st.subheader("💸 Registrar retiro de utilidades")
+        st.caption("Cada retiro queda registrado como egreso y aparece en el historial individual de cada socio.")
+
+        with st.form("form_retiro"):
+            socio = st.radio("Socio", ["Luifer", "Omar"], horizontal=True)
+            c1, c2 = st.columns(2)
+            monto_ret = c1.number_input("Monto a retirar ($)", min_value=0.01, step=0.01)
+            fecha_ret = c2.date_input("Fecha del retiro", value=date.today())
+            desc_ret  = st.text_input("Nota (opcional)", placeholder="Ej: quincena mayo")
+            btn_ret   = st.form_submit_button("💸 Registrar retiro", use_container_width=True, type="primary")
+
+        if btn_ret:
+            if monto_ret <= 0:
+                error("El monto debe ser mayor a 0")
+            elif balance <= 0:
+                error("No hay balance disponible en caja para retirar")
+            elif monto_ret > balance:
+                st.warning(f"⚠️ El monto a retirar ({fmt_usd(monto_ret)}) supera el balance disponible ({fmt_usd(balance)}). ¿Deseas continuar de todos modos?")
+            else:
+                cat_retiro = f"Retiro {socio}"
+                desc_final = desc_ret if desc_ret else f"Retiro de utilidades — {socio}"
+                registrar_movimiento("egreso", cat_retiro, monto_ret, fecha_ret, desc_final)
+                success(f"Retiro de {fmt_usd(monto_ret)} registrado para {socio}")
+                st.rerun()
+
+        # Historial de retiros
+        st.divider()
+        st.subheader("📊 Historial de retiros")
+        if not movs_df.empty:
+            retiros = movs_df[movs_df["categoria"].isin(["Retiro Luifer","Retiro Omar"])].copy()
+            if not retiros.empty:
+                retiros["monto_fmt"] = retiros["monto"].apply(lambda x: f"-{fmt_usd(x)}")
+                st.dataframe(
+                    retiros[["fecha","categoria","descripcion","monto_fmt"]].rename(columns={
+                        "fecha":"Fecha","categoria":"Socio","descripcion":"Nota","monto_fmt":"Monto"}),
+                    use_container_width=True, hide_index=True)
+                col_l, col_o, col_t = st.columns(3)
+                col_l.metric("Total Luifer", fmt_usd(ret_luifer))
+                col_o.metric("Total Omar",   fmt_usd(ret_omar))
+                col_t.metric("Total socios", fmt_usd(ret_luifer + ret_omar))
+            else:
+                st.info("Sin retiros registrados aún.")
+        else:
+            st.info("Sin movimientos registrados.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPORTAR DATOS
