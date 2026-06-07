@@ -266,18 +266,20 @@ if pagina == "🏠 Dashboard":
             st.info("Sin ventas registradas aún.")
 
     with col2:
-        # Top productos por profit
+        # Top productos por profit — solo ventas completadas
         st.subheader("🏆 Top por profit")
-        if not todos_items.empty:
-            top_items = calcular_profit_items(todos_items.copy())
-            top_items["producto"] = top_items["dim_productos"].apply(
-                lambda x: x["codigo"] if isinstance(x, dict) else "—")
-            top = top_items.groupby("producto")["profit"].sum().sort_values(ascending=False).head(8)
-            if not top.empty:
+        if not todos_items.empty and not ventas_df.empty:
+            ids_completadas = set(ventas_df[ventas_df["estado"]=="Completada"]["id"].tolist())
+            top_items = todos_items[todos_items["venta_id"].isin(ids_completadas)].copy()
+            if not top_items.empty:
+                top_items = calcular_profit_items(top_items)
+                top_items["producto"] = top_items["dim_productos"].apply(
+                    lambda x: x["codigo"] if isinstance(x, dict) else "—")
+                top = top_items.groupby("producto")["profit"].sum().sort_values(ascending=False).head(8)
                 for cod, pft in top.items():
                     st.write(f"**{cod}** — {fmt_usd(pft)}")
             else:
-                st.info("Sin datos aún.")
+                st.info("Sin ventas completadas aún.")
         else:
             st.info("Sin ventas.")
 
@@ -1030,7 +1032,13 @@ elif pagina == "🚚 Pedidos":
             ped_row = fil_ped[fil_ped["id"] == ped_det_id].iloc[0]
             if ped_row["estado"] == "Pendiente":
                 st.divider()
-                if st.button("✅ Marcar como recibido — actualiza stock", type="primary", use_container_width=True):
+                col_rec, col_can = st.columns(2)
+                btn_recibir  = col_rec.button("✅ Marcar como recibido — actualiza stock",
+                                               type="primary", use_container_width=True, key="btn_ped_recibir")
+                btn_cancelar_ped = col_can.button("❌ Cancelar pedido",
+                                                   use_container_width=True, key="btn_ped_cancelar")
+
+                if btn_recibir:
                     try:
                         sb.table("fact_pedidos").update({"estado":"Recibido"}).eq("id", ped_det_id).execute()
                         items = get_pedido_items(ped_det_id)
@@ -1043,6 +1051,24 @@ elif pagina == "🚚 Pedidos":
                         st.rerun()
                     except Exception as e:
                         error(f"Error: {e}")
+
+                if btn_cancelar_ped:
+                    try:
+                        sb.table("fact_pedidos").update({"estado":"Cancelado"}).eq("id", ped_det_id).execute()
+                        # El egreso fue registrado al crear el pedido — se crea ingreso compensatorio
+                        registrar_movimiento(
+                            "ingreso", "Cancelación de pedido",
+                            float(ped_row["total"]),
+                            date.today(),
+                            f"Reversión pedido cancelado {ped_det_id[:8]} — {ped_row['proveedor']}",
+                            ped_det_id)
+                        success("Pedido cancelado — egreso revertido en Finanzas")
+                        st.rerun()
+                    except Exception as e:
+                        error(f"Error al cancelar: {e}")
+
+            elif ped_row["estado"] == "Cancelado":
+                st.warning("Este pedido fue cancelado. El egreso original fue revertido en Finanzas.")
             else:
                 st.info(f"Este pedido ya está marcado como **{ped_row['estado']}**.")
 
