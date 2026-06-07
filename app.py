@@ -1058,15 +1058,11 @@ elif pagina == "👥 Clientes":
                     st.rerun()
 
             if btn_del:
-                # Verificar si tiene ventas asociadas
-                ventas_cli = get_ventas()
-                tiene_ventas = False
-                if not ventas_cli.empty:
-                    tiene_ventas = ventas_cli["dim_clientes"].apply(
-                        lambda x: x.get("nombre") if isinstance(x, dict) else None
-                    ).eq(cli_ed["nombre"]).any()
+                # Verificar ventas vinculadas por ID (no por nombre) para evitar falsos positivos con duplicados
+                ventas_por_id = sb.table("fact_ventas").select("id").eq("cliente_id", cli_ed["id"]).execute()
+                tiene_ventas = len(ventas_por_id.data) > 0 if ventas_por_id.data else False
                 if tiene_ventas:
-                    st.warning(f"⚠️ No se puede eliminar — '{cli_ed['nombre']}' tiene ventas registradas. Puedes editar su nombre si es necesario.")
+                    st.warning(f"⚠️ No se puede eliminar — '{cli_ed['nombre']}' tiene {len(ventas_por_id.data)} venta(s) vinculadas a este registro. Puedes editar su nombre si es necesario.")
                 else:
                     sb.table("dim_clientes").delete().eq("id", cli_ed["id"]).execute()
                     success(f"Cliente eliminado")
