@@ -8,7 +8,7 @@ import uuid
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Inventario Herrajes",
+    page_title="MHO — Multi Herrajes Oriente",
     page_icon="🔩",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -133,9 +133,13 @@ div[data-testid="stExpander"] { border: 1px solid #333; border-radius: 8px; }
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://img.icons8.com/ios-filled/100/wrench.png", width=48)
-    st.title("Herrajes & Baños")
-    st.caption("Sistema de inventario")
+    import os
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=110)
+    else:
+        st.image("https://img.icons8.com/ios-filled/100/wrench.png", width=48)
+    st.title("Multi Herrajes Oriente")
+    st.caption("Sistema de inventario · MHO")
     st.divider()
     pagina = st.radio("Navegación", [
         "🏠 Dashboard",
@@ -400,7 +404,12 @@ elif pagina == "📦 Inventario":
                     success("Producto actualizado")
                 else:
                     data["id"] = str(uuid.uuid4())
-                    sb.table("dim_productos").insert(data).execute()
+                    try:
+                        # Guardar el stock inicial real para que la trazabilidad audite contra un valor fijo
+                        sb.table("dim_productos").insert({**data, "stock_inicial": stock}).execute()
+                    except Exception:
+                        # Compatibilidad: si la columna stock_inicial aún no existe en la DB
+                        sb.table("dim_productos").insert(data).execute()
                     success("Producto agregado")
                 st.rerun()
 
@@ -485,25 +494,33 @@ elif pagina == "📦 Inventario":
 
         movimientos_hist.sort(key=sort_key)
 
-        # Calcular stock acumulado en cada paso
-        # Partimos del stock actual en DB y recalculamos hacia adelante
-        # En su lugar reconstruimos: buscamos cuánto entró y cuánto salió
-        # para llegar al estado actual
+        # Calcular entradas y salidas confirmadas
         entradas = sum(m["cantidad"] for m in movimientos_hist
                       if m["tipo"] == "🚚 Pedido recibido" and isinstance(m["cantidad"], int))
         salidas  = sum(m["cantidad"] for m in movimientos_hist
                       if "🛒 Venta" in m["tipo"] and m.get("estado_vta") == "Completada" and isinstance(m["cantidad"], int))
-        # stock_calculado = stock_db (lo que hay) — eso es el resultado final
 
-        # Mostramos la tabla con efecto acumulado
-        stock_running = stock_db - entradas + salidas  # esto sería el stock antes de todo = inicial
-        stock_inicial_calc = stock_running
+        # Stock inicial REAL guardado en la DB (auditoría verdadera).
+        # Si el producto es anterior a esta función (sin stock_inicial), se
+        # reconstruye hacia atrás y la auditoría es solo referencial.
+        stock_ini_db = prod_traz.get("stock_inicial") if hasattr(prod_traz, "get") else prod_traz["stock_inicial"] if "stock_inicial" in prod_traz else None
+        try:
+            stock_ini_db = int(stock_ini_db) if stock_ini_db is not None and not pd.isna(stock_ini_db) else None
+        except (TypeError, ValueError):
+            stock_ini_db = None
+
+        auditoria_real = stock_ini_db is not None
+        if auditoria_real:
+            stock_inicial_calc = stock_ini_db
+        else:
+            stock_inicial_calc = stock_db - entradas + salidas  # referencial (no audita)
+            st.info("ℹ️ Este producto no tiene stock inicial registrado — la comparación es solo referencial. Los productos nuevos guardan su stock inicial automáticamente.")
 
         rows_traz = []
         rows_traz.append({
             "Fecha":       "Inicio",
             "Tipo":        "📋 Stock inicial",
-            "Referencia":  "Carga del sistema",
+            "Referencia":  "Registrado en el sistema" if auditoria_real else "Reconstruido (referencial)",
             "Movimiento":  "—",
             "Stock calc.": stock_inicial_calc
         })
@@ -544,10 +561,13 @@ elif pagina == "📦 Inventario":
         diferencia = stock_running - stock_db
         if diferencia == 0:
             c3.metric("Diferencia", "0 ✅")
-            st.success("✅ El stock calculado coincide con el registrado en base de datos.")
+            if auditoria_real:
+                st.success("✅ Auditoría OK: el historial de movimientos reproduce exactamente el stock actual.")
+            else:
+                st.success("✅ El historial reconstruido coincide con el stock actual (comparación referencial).")
         else:
             c3.metric("Diferencia", f"{diferencia:+d} ⚠️")
-            st.warning(f"⚠️ Hay una diferencia de **{abs(diferencia)} unidades** entre el historial y la base de datos. Revisa si hay ventas pendientes de confirmar o ajustes manuales de stock.")
+            st.warning(f"⚠️ Diferencia de **{abs(diferencia)} unidades** entre el historial y la base de datos. Causas posibles: ajuste manual de stock en 'Editar producto', un registro faltante, o un error de captura. Revisa los movimientos listados arriba contra tus documentos físicos.")
 
         # Resumen del producto
         st.divider()
@@ -655,12 +675,13 @@ elif pagina == "🛒 Nueva Venta":
                 col_desc, col_qty, col_price, col_profit, col_margin, col_del = st.columns([3,1,1,1,1,0.5])
                 col_desc.markdown(f"**{it['codigo']}** {it['descripcion']}")
 
+                item_key = it["producto_id"]
                 new_qty = col_qty.number_input(
                     "Cant.", min_value=1, value=it["cantidad"],
-                    key=f"qty_{idx}", label_visibility="collapsed")
+                    key=f"qty_{item_key}", label_visibility="collapsed")
                 new_price = col_price.number_input(
                     "Precio", min_value=0.0, step=0.01, value=it["precio_unitario"],
-                    key=f"price_{idx}", label_visibility="collapsed", format="%.2f")
+                    key=f"price_{item_key}", label_visibility="collapsed", format="%.2f")
 
                 # Actualizar si cambió cantidad o precio
                 if new_qty != it["cantidad"] or new_price != it["precio_unitario"]:
@@ -676,8 +697,12 @@ elif pagina == "🛒 Nueva Venta":
                 col_profit.caption(f"Profit: **{fmt_usd(nuevo_profit)}**")
                 col_margin.caption(f"**{nuevo_margen:.1f}%**")
 
-                if col_del.button("✕", key=f"del_{idx}", help="Eliminar este producto"):
+                if col_del.button("✕", key=f"del_{item_key}", help="Eliminar este producto"):
                     st.session_state.items_venta.pop(idx)
+                    # Limpiar estado de widgets del item eliminado para evitar herencia de valores
+                    for k in (f"qty_{item_key}", f"price_{item_key}"):
+                        if k in st.session_state:
+                            del st.session_state[k]
                     st.rerun()
 
         # Recalcular totales con valores actuales
@@ -1122,12 +1147,18 @@ elif pagina == "👥 Clientes":
             if not nombre:
                 error("El nombre es obligatorio")
             else:
-                sb.table("dim_clientes").insert({
-                    "id": str(uuid.uuid4()), "nombre": nombre, "rif_cedula": rif,
-                    "telefono": tel, "email": email, "direccion": dir_, "tipo": tipo
-                }).execute()
-                success("Cliente guardado")
-                st.rerun()
+                # Prevenir duplicados: verificar nombre existente (sin distinguir mayúsculas/espacios)
+                existentes = sb.table("dim_clientes").select("id, nombre").execute()
+                nombres_norm = {c["nombre"].strip().lower() for c in (existentes.data or [])}
+                if nombre.strip().lower() in nombres_norm:
+                    st.warning(f"⚠️ Ya existe un cliente llamado '{nombre.strip()}'. Verifica en 'Ver clientes' antes de crear un duplicado. Si realmente es otra persona con el mismo nombre, agrégale una distinción (ej: ciudad o apellido).")
+                else:
+                    sb.table("dim_clientes").insert({
+                        "id": str(uuid.uuid4()), "nombre": nombre.strip(), "rif_cedula": rif,
+                        "telefono": tel, "email": email, "direccion": dir_, "tipo": tipo
+                    }).execute()
+                    success("Cliente guardado")
+                    st.rerun()
 
     with tab3_cli:
         df_cli_ed = get_clientes()
