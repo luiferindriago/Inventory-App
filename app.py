@@ -907,6 +907,191 @@ elif pagina == "📋 Historial Ventas":
                     columns={"producto":"Producto","cantidad":"Cant."}),
                 use_container_width=True, hide_index=True)
 
+    # ── EDITAR UNA VENTA EXISTENTE ─────────────────────────────────────────────
+    st.divider()
+    with st.expander("✏️ Editar una venta registrada"):
+        st.caption("Corrige productos, cantidades o precios de una venta ya registrada. "
+                   "El stock y el ingreso en Finanzas se ajustan automáticamente.")
+
+        # Solo Completadas y Pendientes de pago son editables
+        editables = ventas_df[ventas_df["estado"].isin(["Completada","Pendiente de pago"])].copy()
+        if editables.empty:
+            st.info("No hay ventas editables.")
+        else:
+            ed_opts = {
+                f"{r['fecha']} — {r['cliente_nombre']} — {fmt_usd(r['total'])} [{r['estado']}]": r["id"]
+                for _, r in editables.iterrows()
+            }
+            ed_sel_key = st.selectbox("Selecciona la venta a editar", list(ed_opts.keys()), key="edit_venta_sel")
+            edit_venta_id = ed_opts[ed_sel_key]
+            venta_row = editables[editables["id"] == edit_venta_id].iloc[0]
+            estado_original = venta_row["estado"]
+
+            # Cargar items actuales a session_state (una sola vez por venta seleccionada)
+            sskey = f"edit_items_{edit_venta_id}"
+            if sskey not in st.session_state:
+                items_orig = get_venta_items(edit_venta_id)
+                cargados = []
+                if not items_orig.empty:
+                    for _, it in items_orig.iterrows():
+                        prod = it.get("dim_productos") or {}
+                        cargados.append({
+                            "producto_id": str(it["producto_id"]),
+                            "codigo": prod.get("codigo","?") if isinstance(prod, dict) else "?",
+                            "descripcion": prod.get("descripcion","?") if isinstance(prod, dict) else "?",
+                            "cantidad": int(it["cantidad"]),
+                            "precio_unitario": float(it["precio_unitario"]),
+                            "costo_unitario": float(prod.get("precio_costo",0)) if isinstance(prod, dict) else 0.0,
+                            "subtotal": float(it["subtotal"]),
+                        })
+                st.session_state[sskey] = cargados
+
+            edit_items = st.session_state[sskey]
+
+            # Agregar un producto nuevo a la venta editada
+            prods_all = get_productos()
+            st.markdown("**Agregar producto a esta venta**")
+            ap1, ap2, ap3, ap4 = st.columns([3,1,1,1])
+            prod_add_opts = {f"{r['codigo']} — {r['descripcion']}": r for _, r in prods_all.iterrows()}
+            prod_add_sel = ap1.selectbox("Producto", list(prod_add_opts.keys()),
+                                          key=f"add_prod_{edit_venta_id}", label_visibility="collapsed")
+            prod_add = prod_add_opts[prod_add_sel]
+            qty_add = ap2.number_input("Cant.", min_value=1, value=1,
+                                        key=f"add_qty_{edit_venta_id}", label_visibility="collapsed")
+            price_add = ap3.number_input("Precio", min_value=0.0, step=0.01,
+                                          value=float(prod_add["precio_venta"]),
+                                          key=f"add_price_{edit_venta_id}", label_visibility="collapsed", format="%.2f")
+            if ap4.button("➕ Añadir", key=f"add_btn_{edit_venta_id}"):
+                existing = next((x for x in edit_items if x["producto_id"] == str(prod_add["id"])), None)
+                if existing:
+                    existing["cantidad"] += qty_add
+                    existing["subtotal"] = existing["cantidad"] * existing["precio_unitario"]
+                else:
+                    edit_items.append({
+                        "producto_id": str(prod_add["id"]),
+                        "codigo": prod_add["codigo"],
+                        "descripcion": prod_add["descripcion"],
+                        "cantidad": qty_add,
+                        "precio_unitario": price_add,
+                        "costo_unitario": float(prod_add["precio_costo"]),
+                        "subtotal": qty_add * price_add,
+                    })
+                st.rerun()
+
+            # Listar items editables
+            if not edit_items:
+                st.info("Esta venta no tiene productos. Añade al menos uno o elimina la venta desde otra opción.")
+            else:
+                st.markdown("**Productos en la venta**")
+                total_edit = 0
+                for i, it in enumerate(edit_items):
+                    k = it["producto_id"]
+                    c_desc, c_qty, c_price, c_sub, c_del = st.columns([3,1,1,1,0.5])
+                    c_desc.markdown(f"**{it['codigo']}** {it['descripcion']}")
+                    nq = c_qty.number_input("Cant.", min_value=1, value=it["cantidad"],
+                                             key=f"eq_{edit_venta_id}_{k}", label_visibility="collapsed")
+                    npr = c_price.number_input("Precio", min_value=0.0, step=0.01, value=it["precio_unitario"],
+                                                key=f"ep_{edit_venta_id}_{k}", label_visibility="collapsed", format="%.2f")
+                    if nq != it["cantidad"] or npr != it["precio_unitario"]:
+                        it["cantidad"] = nq
+                        it["precio_unitario"] = npr
+                        it["subtotal"] = nq * npr
+                        st.rerun()
+                    c_sub.markdown(fmt_usd(it["subtotal"]))
+                    if c_del.button("✕", key=f"ed_del_{edit_venta_id}_{k}", help="Quitar producto"):
+                        edit_items.pop(i)
+                        st.rerun()
+                    total_edit += it["subtotal"]
+
+                st.markdown(f"### Nuevo total: **{fmt_usd(total_edit)}**")
+                if estado_original != venta_row["estado"]:
+                    pass
+
+                colg1, colg2 = st.columns(2)
+                guardar_edit = colg1.button("💾 Guardar cambios", type="primary",
+                                             use_container_width=True, key=f"save_edit_{edit_venta_id}")
+                cancelar_edit = colg2.button("↩️ Descartar cambios",
+                                              use_container_width=True, key=f"discard_edit_{edit_venta_id}")
+
+                if cancelar_edit:
+                    del st.session_state[sskey]
+                    st.rerun()
+
+                # Advertencia de stock negativo antes de guardar (no bloquea)
+                if estado_original == "Completada":
+                    items_orig_check = get_venta_items(edit_venta_id)
+                    orig_qty = {str(r["producto_id"]): int(r["cantidad"]) for _, r in items_orig_check.iterrows()} if not items_orig_check.empty else {}
+                    avisos_neg = []
+                    for x in edit_items:
+                        pid = x["producto_id"]
+                        pr = prods_all[prods_all["id"] == pid]
+                        if not pr.empty:
+                            stock_disp = int(pr.iloc[0]["stock_actual"]) + orig_qty.get(pid, 0)
+                            if x["cantidad"] > stock_disp:
+                                avisos_neg.append(f"**{x['codigo']}**: necesitas {x['cantidad']} pero solo hay {stock_disp} disponibles")
+                    if avisos_neg:
+                        st.warning("⚠️ Esta edición dejaría stock negativo en: " + "; ".join(avisos_neg) +
+                                   ". Puedes continuar si es una venta contra pedido.")
+
+                if guardar_edit:
+                    if not edit_items:
+                        error("La venta debe tener al menos un producto")
+                    else:
+                        try:
+                            # ── PASO 1: Revertir efectos de la venta original ──────────
+                            items_actuales = get_venta_items(edit_venta_id)
+                            if estado_original == "Completada":
+                                # Devolver al stock lo que la venta original había descontado
+                                for _, it in items_actuales.iterrows():
+                                    pr = sb.table("dim_productos").select("stock_actual").eq(
+                                        "id", it["producto_id"]).execute()
+                                    if pr.data:
+                                        sb.table("dim_productos").update({
+                                            "stock_actual": pr.data[0]["stock_actual"] + int(it["cantidad"])
+                                        }).eq("id", it["producto_id"]).execute()
+
+                            # ── PASO 2: Borrar los items viejos ────────────────────────
+                            sb.table("fact_venta_items").delete().eq("venta_id", edit_venta_id).execute()
+
+                            # ── PASO 3: Insertar los items nuevos ──────────────────────
+                            nuevo_total = sum(x["subtotal"] for x in edit_items)
+                            for x in edit_items:
+                                sb.table("fact_venta_items").insert({
+                                    "id": str(uuid.uuid4()), "venta_id": edit_venta_id,
+                                    "producto_id": x["producto_id"],
+                                    "cantidad": x["cantidad"],
+                                    "precio_unitario": x["precio_unitario"],
+                                    "subtotal": x["subtotal"]
+                                }).execute()
+
+                            # ── PASO 4: Aplicar el nuevo descuento de stock ────────────
+                            if estado_original == "Completada":
+                                for x in edit_items:
+                                    pr = sb.table("dim_productos").select("stock_actual").eq(
+                                        "id", x["producto_id"]).execute()
+                                    if pr.data:
+                                        sb.table("dim_productos").update({
+                                            "stock_actual": pr.data[0]["stock_actual"] - x["cantidad"]
+                                        }).eq("id", x["producto_id"]).execute()
+
+                            # ── PASO 5: Actualizar el total de la venta ────────────────
+                            sb.table("fact_ventas").update({"total": nuevo_total}).eq(
+                                "id", edit_venta_id).execute()
+
+                            # ── PASO 6: Corregir el ingreso en Finanzas (solo Completada) ─
+                            if estado_original == "Completada":
+                                mov = sb.table("fact_movimientos").select("id").eq(
+                                    "referencia_id", edit_venta_id).eq("tipo","ingreso").execute()
+                                if mov.data:
+                                    sb.table("fact_movimientos").update({"monto": nuevo_total}).eq(
+                                        "id", mov.data[0]["id"]).execute()
+
+                            del st.session_state[sskey]
+                            success("Venta actualizada — stock y finanzas ajustados")
+                            st.rerun()
+                        except Exception as e:
+                            error(f"Error al actualizar la venta: {e}")
+
     st.divider()
     csv = fil.drop(columns=["dim_clientes"], errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button("📥 Exportar CSV", csv, "ventas.csv", "text/csv")
