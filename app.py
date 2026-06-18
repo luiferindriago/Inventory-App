@@ -1283,6 +1283,20 @@ elif pagina == "🚚 Pedidos":
                     error(f"No se pudo registrar el pedido: {str(e)[:120]}")
 
     with tab1:
+        # Confirmación persistente del último pedido recibido
+        if st.session_state.get("pedido_recibido_ok"):
+            info_r = st.session_state["pedido_recibido_ok"]
+            st.success(f"✅ Pedido **{info_r['ref']}** recibido — stock actualizado.")
+            if info_r["cambios"]:
+                with st.expander("📊 Precios actualizados en este pedido", expanded=True):
+                    for c in info_r["cambios"]:
+                        st.write(f"• {c}")
+            else:
+                st.caption("No hubo cambios de precio (los costos coincidían con los actuales).")
+            if st.button("Entendido", key="clear_ped_recibido"):
+                del st.session_state["pedido_recibido_ok"]
+                st.rerun()
+
         pedidos_df = get_pedidos()
         if pedidos_df.empty:
             st.info("Sin pedidos registrados.")
@@ -1337,15 +1351,46 @@ elif pagina == "🚚 Pedidos":
                     try:
                         sb.table("fact_pedidos").update({"estado":"Recibido"}).eq("id", ped_det_id).execute()
                         items = get_pedido_items(ped_det_id)
+                        cambios_precio = []
                         for _, item in items.iterrows():
-                            prod = sb.table("dim_productos").select("stock_actual").eq("id", item["producto_id"]).execute()
+                            prod = sb.table("dim_productos").select(
+                                "stock_actual, precio_costo, precio_venta, codigo").eq(
+                                "id", item["producto_id"]).execute()
                             if prod.data:
-                                nuevo_stock = prod.data[0]["stock_actual"] + item["cantidad"]
-                                sb.table("dim_productos").update({"stock_actual": nuevo_stock}).eq("id", item["producto_id"]).execute()
-                        success("Stock actualizado al recibir pedido")
+                                p = prod.data[0]
+                                nuevo_stock = p["stock_actual"] + item["cantidad"]
+                                update_data = {"stock_actual": nuevo_stock}
+
+                                # Actualizar costo si el del pedido difiere del actual
+                                costo_pedido = float(item["costo_unitario"])
+                                costo_actual = float(p["precio_costo"]) if p["precio_costo"] else 0
+                                if costo_pedido > 0 and abs(costo_pedido - costo_actual) > 0.001:
+                                    update_data["precio_costo"] = costo_pedido
+                                    # Recalcular precio de venta manteniendo el margen sobre costo
+                                    venta_actual = float(p["precio_venta"]) if p["precio_venta"] else 0
+                                    if costo_actual > 0 and venta_actual > 0:
+                                        margen_ratio = venta_actual / costo_actual
+                                        nuevo_venta = round(costo_pedido * margen_ratio, 2)
+                                        update_data["precio_venta"] = nuevo_venta
+                                        cambios_precio.append(
+                                            f"{p['codigo']}: costo ${costo_actual:.2f}→${costo_pedido:.2f}, "
+                                            f"venta ${venta_actual:.2f}→${nuevo_venta:.2f}")
+                                    else:
+                                        cambios_precio.append(
+                                            f"{p['codigo']}: costo ${costo_actual:.2f}→${costo_pedido:.2f} "
+                                            f"(ajusta el precio de venta manualmente)")
+
+                                sb.table("dim_productos").update(update_data).eq(
+                                    "id", item["producto_id"]).execute()
+
+                        # Confirmación persistente con detalle de cambios de precio
+                        st.session_state["pedido_recibido_ok"] = {
+                            "ref": ped_det_id[:8].upper(),
+                            "cambios": cambios_precio,
+                        }
                         st.rerun()
                     except Exception as e:
-                        error(f"Error: {e}")
+                        error(f"Error al recibir pedido: {str(e)[:120]}")
 
                 if btn_cancelar_ped:
                     try:
