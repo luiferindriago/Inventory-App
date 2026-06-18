@@ -478,14 +478,21 @@ elif pagina == "📦 Inventario":
             ped_items_r = sb.table("fact_pedido_items")                .select("*, fact_pedidos(fecha, estado, proveedor_nombre)")                .eq("producto_id", prod_id).execute()
             for pi in (ped_items_r.data or []):
                 ped = pi.get("fact_pedidos") or {}
+                estado_p = ped.get("estado","")
+                if estado_p == "Recibido":
+                    tipo_label = "🚚 Pedido recibido"
+                elif estado_p == "Cancelado":
+                    tipo_label = "🚫 Pedido cancelado"
+                else:
+                    tipo_label = "🕐 Pedido pendiente"
                 movimientos_hist.append({
                     "fecha": ped.get("fecha","—"),
-                    "tipo": "🚚 Pedido recibido" if ped.get("estado") == "Recibido" else "🕐 Pedido pendiente",
+                    "tipo": tipo_label,
                     "referencia": ped.get("proveedor_nombre","—"),
                     "cantidad": int(pi["cantidad"]),
                     "efecto": f'+{pi["cantidad"]}',
                     "costo_unit": float(pi.get("costo_unitario", 0)),
-                    "estado_ped": ped.get("estado",""),
+                    "estado_ped": estado_p,
                     "_orden": 1,
                     "_stock_calc": None
                 })
@@ -569,11 +576,21 @@ elif pagina == "📦 Inventario":
             elif "precio_unit" in m:
                 extra = f"P.Venta: ${m['precio_unit']:.2f}/u"
 
+            # Determinar etiqueta del movimiento según estado
+            if es_entrada or es_venta_comp:
+                mov_label = m["efecto"]
+            elif "cancelado" in m["tipo"].lower():
+                mov_label = "anulado"
+            elif "pendiente" in m["tipo"].lower():
+                mov_label = f"{m['efecto']} (al recibir)"
+            else:
+                mov_label = f"{m['efecto']} (sin efecto)"
+
             rows_traz.append({
                 "Fecha":       m["fecha"],
                 "Tipo":        m["tipo"],
                 "Referencia":  m["referencia"] + (f" · {extra}" if extra else ""),
-                "Movimiento":  m["efecto"] if (es_entrada or es_venta_comp) else f"({m['efecto']} sin efecto)",
+                "Movimiento":  mov_label,
                 "Stock calc.": stock_running if (es_entrada or es_venta_comp) else "—"
             })
 
