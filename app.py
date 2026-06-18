@@ -396,22 +396,48 @@ elif pagina == "📦 Inventario":
             if not codigo or not desc:
                 error("Código y descripción son obligatorios")
             else:
-                data = {"codigo": codigo.upper(), "descripcion": desc, "categoria": cat,
+                codigo_norm = codigo.upper().strip()
+                data = {"codigo": codigo_norm, "descripcion": desc, "categoria": cat,
                         "stock_actual": stock, "stock_minimo": stock_min,
                         "precio_costo": costo, "precio_venta": pventa, "unidad": unidad}
                 if modo == "Editar existente" and prod_sel is not None:
-                    sb.table("dim_productos").update(data).eq("id", prod_sel["id"]).execute()
-                    success("Producto actualizado")
-                else:
-                    data["id"] = str(uuid.uuid4())
+                    # Si cambió el código, verificar que el nuevo no choque con otro producto
+                    if codigo_norm != prod_sel["codigo"]:
+                        dup = sb.table("dim_productos").select("id").eq("codigo", codigo_norm).execute()
+                        if dup.data:
+                            error(f"Ya existe otro producto con el código '{codigo_norm}'")
+                            st.stop()
                     try:
-                        # Guardar el stock inicial real para que la trazabilidad audite contra un valor fijo
-                        sb.table("dim_productos").insert({**data, "stock_inicial": stock}).execute()
-                    except Exception:
-                        # Compatibilidad: si la columna stock_inicial aún no existe en la DB
-                        sb.table("dim_productos").insert(data).execute()
-                    success("Producto agregado")
-                st.rerun()
+                        sb.table("dim_productos").update(data).eq("id", prod_sel["id"]).execute()
+                        success("Producto actualizado")
+                        st.rerun()
+                    except Exception as e:
+                        error(f"No se pudo actualizar el producto: {str(e)[:120]}")
+                else:
+                    # Validar código duplicado ANTES de intentar insertar
+                    dup = sb.table("dim_productos").select("id, descripcion").eq("codigo", codigo_norm).execute()
+                    if dup.data:
+                        existente = dup.data[0].get("descripcion", "")
+                        error(f"Ya existe un producto con el código '{codigo_norm}' ({existente}). Usa un código distinto o edítalo desde 'Editar existente'.")
+                    else:
+                        data["id"] = str(uuid.uuid4())
+                        try:
+                            # Guardar stock inicial para auditoría de trazabilidad
+                            sb.table("dim_productos").insert({**data, "stock_inicial": stock}).execute()
+                            success("Producto agregado")
+                            st.rerun()
+                        except Exception as e:
+                            msg = str(e)
+                            if "stock_inicial" in msg or "column" in msg.lower():
+                                # La columna stock_inicial no existe aún — insertar sin ella
+                                try:
+                                    sb.table("dim_productos").insert(data).execute()
+                                    success("Producto agregado (sin stock inicial — ejecuta la migración SQL para activar auditoría)")
+                                    st.rerun()
+                                except Exception as e2:
+                                    error(f"No se pudo guardar el producto: {str(e2)[:120]}")
+                            else:
+                                error(f"No se pudo guardar el producto: {msg[:120]}")
 
 
     with tab3:
@@ -591,6 +617,16 @@ elif pagina == "📦 Inventario":
 elif pagina == "🛒 Nueva Venta":
     st.title("🛒 Nueva Venta")
 
+    # Confirmación persistente de la última venta registrada
+    if st.session_state.get("ultima_venta_ok"):
+        info_v = st.session_state["ultima_venta_ok"]
+        st.success(f"✅ Venta registrada — Ref: **{info_v['ref']}** · Cliente: {info_v['cliente']} · "
+                   f"Total: {info_v['total']} · Estado: {info_v['estado']}. "
+                   f"Puedes verla en 'Historial Ventas'.")
+        if st.button("Registrar otra venta", key="clear_venta_ok"):
+            del st.session_state["ultima_venta_ok"]
+            st.rerun()
+
     productos_df = get_productos()
     clientes_df  = get_clientes()
 
@@ -759,11 +795,16 @@ elif pagina == "🛒 Nueva Venta":
                     registrar_movimiento("ingreso","Venta", total_ingresos, fecha_venta,
                                         f"Venta {venta_id[:8]} — {cliente_sel}", venta_id)
 
+                st.session_state["ultima_venta_ok"] = {
+                    "ref": venta_id[:8].upper(),
+                    "cliente": cliente_sel if cliente_sel != "— Sin cliente —" else "Cliente directo",
+                    "total": fmt_usd(total_ingresos),
+                    "estado": estado_venta,
+                }
                 st.session_state.items_venta = []
-                success("Venta registrada exitosamente")
                 st.rerun()
             except Exception as e:
-                error(f"Error al guardar: {e}")
+                error(f"No se pudo registrar la venta: {str(e)[:120]}")
     else:
         st.info("Agrega productos arriba para comenzar la venta.")
 
@@ -1158,12 +1199,26 @@ elif pagina == "🚚 Pedidos":
             total_ped = (items_pedido["Pedir"] * items_pedido["Costo unit. $"]).sum()
             st.metric(f"Total estimado ({len(items_pedido)} productos)", fmt_usd(total_ped))
 
-        if st.button("✅ Registrar pedido", type="primary", use_container_width=True):
+        # Mostrar confirmación persistente del último pedido registrado
+        if st.session_state.get("ultimo_pedido_ok"):
+            info_ped = st.session_state["ultimo_pedido_ok"]
+            st.success(f"✅ Pedido registrado correctamente — Ref: **{info_ped['ref']}** · "
+                       f"Proveedor: {info_ped['proveedor']} · Total: {info_ped['total']} · "
+                       f"{info_ped['n_items']} producto(s). Ve a 'Ver pedidos' para gestionarlo.")
+            if st.button("Entendido, registrar otro pedido", key="clear_ped_ok"):
+                del st.session_state["ultimo_pedido_ok"]
+                st.rerun()
+
+        registrar_ped_btn = st.button("✅ Registrar pedido", type="primary", use_container_width=True,
+                                       disabled=bool(st.session_state.get("registrando_pedido", False)))
+        if registrar_ped_btn:
             if items_pedido.empty:
                 warn("Agrega al menos un producto con cantidad > 0")
             elif not prov_nombre:
                 warn("Ingresa el nombre del proveedor")
             else:
+                # Bandera anti doble-registro
+                st.session_state["registrando_pedido"] = True
                 try:
                     ensure_fecha(fecha_ped)
                     pedido_id = str(uuid.uuid4())
@@ -1181,6 +1236,7 @@ elif pagina == "🚚 Pedidos":
                         "estado": "Pendiente", "total": float(total_ped)
                     }).execute()
 
+                    n_items = 0
                     for idx, row in items_pedido.iterrows():
                         prod_match = productos_df[productos_df["codigo"] == row["Código"]]
                         if prod_match.empty: continue
@@ -1191,13 +1247,23 @@ elif pagina == "🚚 Pedidos":
                             "costo_unitario": float(row["Costo unit. $"]),
                             "subtotal": float(row["Pedir"] * row["Costo unit. $"])
                         }).execute()
+                        n_items += 1
 
                     registrar_movimiento("egreso","Compra de mercancía", total_ped,
                                         fecha_ped, f"Pedido {pedido_id[:8]} — {prov_nombre}", pedido_id)
-                    success("Pedido registrado")
+
+                    # Guardar confirmación persistente
+                    st.session_state["ultimo_pedido_ok"] = {
+                        "ref": pedido_id[:8].upper(),
+                        "proveedor": prov_nombre,
+                        "total": fmt_usd(total_ped),
+                        "n_items": n_items,
+                    }
+                    st.session_state["registrando_pedido"] = False
                     st.rerun()
                 except Exception as e:
-                    error(f"Error: {e}")
+                    st.session_state["registrando_pedido"] = False
+                    error(f"No se pudo registrar el pedido: {str(e)[:120]}")
 
     with tab1:
         pedidos_df = get_pedidos()
@@ -1212,8 +1278,10 @@ elif pagina == "🚚 Pedidos":
         estado_fil_ped = st.selectbox("Filtrar por estado", ["Todos","Pendiente","Recibido","Cancelado"], key="fil_ped_estado")
         fil_ped = pedidos_df if estado_fil_ped == "Todos" else pedidos_df[pedidos_df["estado"] == estado_fil_ped]
 
-        fil_ped_display = fil_ped[["fecha","proveedor","fecha_eta","total","estado"]].copy()
-        fil_ped_display.columns = ["Fecha","Proveedor","ETA","Total","Estado"]
+        fil_ped_display = fil_ped[["id","fecha","proveedor","fecha_eta","total","estado"]].copy()
+        fil_ped_display["Ref"] = fil_ped_display["id"].apply(lambda x: x[:8].upper())
+        fil_ped_display = fil_ped_display[["Ref","fecha","proveedor","fecha_eta","total","estado"]]
+        fil_ped_display.columns = ["Ref","Fecha","Proveedor","ETA","Total","Estado"]
         fil_ped_display["Total"] = fil_ped_display["Total"].apply(fmt_usd)
         st.dataframe(fil_ped_display, use_container_width=True, hide_index=True)
 
@@ -1223,7 +1291,7 @@ elif pagina == "🚚 Pedidos":
         st.divider()
         st.subheader("🔍 Ver detalle de pedido")
         if not fil_ped.empty:
-            ped_opts_all = {f"{r['fecha']} — {r['proveedor']} — {fmt_usd(r['total'])} [{r['estado']}]": r["id"]
+            ped_opts_all = {f"[{r['id'][:8].upper()}] {r['fecha']} — {r['proveedor']} — {fmt_usd(r['total'])} [{r['estado']}]": r["id"]
                            for _, r in fil_ped.iterrows()}
             ped_det_sel = st.selectbox("Selecciona pedido", list(ped_opts_all.keys()), key="ped_det_sel")
             ped_det_id = ped_opts_all[ped_det_sel]
@@ -1473,7 +1541,7 @@ elif pagina == "💰 Finanzas":
                 error("El monto debe ser mayor a 0")
             else:
                 registrar_movimiento(tipo, cat, monto, fecha, desc)
-                success("Movimiento registrado")
+                st.success(f"✅ Movimiento registrado: {tipo} de {fmt_usd(monto)} en '{cat}'")
                 st.rerun()
 
     with tab3_fin:
