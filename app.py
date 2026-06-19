@@ -1395,17 +1395,14 @@ elif pagina == "🚚 Pedidos":
                 if btn_cancelar_ped:
                     try:
                         sb.table("fact_pedidos").update({"estado":"Cancelado"}).eq("id", ped_det_id).execute()
-                        # El egreso fue registrado al crear el pedido — se crea ingreso compensatorio
-                        registrar_movimiento(
-                            "ingreso", "Cancelación de pedido",
-                            float(ped_row["total"]),
-                            date.today(),
-                            f"Reversión pedido cancelado {ped_det_id[:8]} — {ped_row['proveedor']}",
-                            ped_det_id)
-                        success("Pedido cancelado — egreso revertido en Finanzas")
+                        # Eliminar el egreso original que se creó al registrar el pedido
+                        # (más limpio que crear un ingreso compensatorio)
+                        sb.table("fact_movimientos").delete().eq(
+                            "referencia_id", ped_det_id).eq("tipo","egreso").execute()
+                        success("Pedido cancelado — egreso eliminado de Finanzas")
                         st.rerun()
                     except Exception as e:
-                        error(f"Error al cancelar: {e}")
+                        error(f"Error al cancelar: {str(e)[:120]}")
 
             elif ped_row["estado"] == "Cancelado":
                 st.warning("Este pedido fue cancelado. El egreso original fue revertido en Finanzas.")
